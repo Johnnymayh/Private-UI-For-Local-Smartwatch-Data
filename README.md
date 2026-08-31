@@ -23,6 +23,10 @@ your machine. Built for Xiaomi/Huami wearables synced through Gadgetbridge.
 - **Full diagnostics panel**  every table in your database, per-night raw sleep-code
   durations, and per-day activity stats, so you can see exactly why a number looks the way
   it does and recalibrate the sidebar settings to match your specific device.
+  **Private Customisable Journal** you can make a journal text document with your own personal
+  customisable yes/no inputs. You save the text file locally and input it with context for each
+  day, so that the trends of how these inputs affect your data can be calculated. The text file 
+  should be in the same directory as your GadgetBridge dataset and the dashboard files.
 
 ## Setup
 

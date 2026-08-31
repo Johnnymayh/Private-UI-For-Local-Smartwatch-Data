@@ -46,12 +46,9 @@ def to_local(series_or_ts, unit, tz):
     return dt_utc.dt.tz_convert(tz).dt.tz_localize(None)
 
 
-# --- Session-state defaults ---------------------------------------------------------------
-# The person wants the sidebar to show ONLY the date list day-to-day; everything else below
-# lives in a collapsed "Advanced Settings" expander. But several of those settings (timezone,
-# table overrides, sleep-stage codes) are needed *before* we can even load the data that the
-# date list depends on. Pre-seeding session_state lets us read current values early while the
-# widgets themselves render later in the page, keyed to these same session_state entries.
+# Session-state defaults. Pre-seeded here (rather than set via widget defaults) so their
+# values are available before the widgets that control them are actually rendered further
+# down the sidebar - several are needed early, to load the data the date list depends on.
 _DEFAULTS = {
     "tz_name": "Europe/London",
     "max_hr_override": 190,
@@ -62,6 +59,7 @@ _DEFAULTS = {
     "rem_codes": "4",
     "awake_codes": "",
     "sleep_table_override": "Auto-Detect",
+    "journal_tags": "Alcohol, Caffeine (evening), Drugs/Medication, Fish, Late Meal, Screen Before Bed, Stretching/Yoga, Travel, Feeling Sick, High Stress Day",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -190,8 +188,8 @@ def get_cleaned_activity_df(table_name, mtime, tz_name):
 df_activity = get_cleaned_activity_df(activity_table, _db_mtime(), st.session_state.tz_name) if activity_table else pd.DataFrame()
 
 
-# --- Sleep + HRV engine, refactored to run per-date so it can power both the main dashboard
-# and the sidebar's per-day HRV list --------------------------------------------------------
+# Sleep + HRV engine. Runs per-date so it can power both the main dashboard and the
+# sidebar's per-day HRV list.
 
 def classify_stage(raw, deep_codes, light_codes, rem_codes, awake_codes):
     """Map a raw stage code/label to a bucket using the sidebar-configured code sets
@@ -427,7 +425,102 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
     return result
 
 
-# --- Sidebar: date list (the only thing shown by default) ----------------------------------
+STRAIN_ACTIVITY_GATE = 15  # bpm above resting before a minute counts toward strain load
+
+
+@st.cache_data
+def compute_strain_for_date(target_date, activity_table, active_sleep_table, mtime, tz_name,
+                             deep_codes_str, light_codes_str, rem_codes_str, awake_codes_str,
+                             max_hr_override, resting_hr_override, sensitivity):
+    """Day Strain (0-21): duration-weighted heart-rate-reserve load via Banister TRIMP.
+    Whoop's own algorithm is proprietary and unpublished. Resting HR defaults to the night's
+    actual overnight HR; minutes are smoothed and gated so ordinary daytime drift doesn't count
+    as load; and "today" starts at wake time rather than midnight, matching how Whoop defines a
+    day (sleep-to-sleep), since evening activity before falling asleep otherwise bleeds into the
+    next day's score."""
+    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name,
+                                        deep_codes_str, light_codes_str, rem_codes_str, awake_codes_str)
+    activity_df = get_cleaned_activity_df(activity_table, mtime, tz_name) if activity_table else pd.DataFrame()
+    day_df = activity_df[activity_df['Date'] == target_date] if not activity_df.empty and 'Date' in activity_df.columns else pd.DataFrame()
+
+    sleep_window_end = sleep_info["sleep_window_end"]
+    if sleep_window_end is not None and pd.Timestamp(sleep_window_end).date() <= target_date:
+        floor = sleep_window_end
+    else:
+        floor = datetime.combine(target_date, datetime.min.time())
+
+    if not day_df.empty and 'Datetime' in day_df.columns:
+        src = day_df[day_df['Datetime'] >= floor]
+    else:
+        src = day_df
+    hr = src['HEART_RATE'].dropna() if not src.empty and 'HEART_RATE' in src.columns else pd.Series(dtype=float)
+
+    strain = 0.0
+    if not hr.empty:
+        auto_resting = sleep_info["sleep_hr_median"] if pd.notna(sleep_info["sleep_hr_median"]) else hr.quantile(0.10)
+        resting_hr = resting_hr_override if resting_hr_override > 0 else max(40.0, auto_resting)
+        hr_reserve = max(1.0, max_hr_override - resting_hr)
+        smoothed = hr.sort_index().rolling(5, min_periods=1, center=True).median()
+        active = smoothed[smoothed >= (resting_hr + STRAIN_ACTIVITY_GATE)]
+        frac = ((active - resting_hr) / hr_reserve).clip(lower=0, upper=1)
+        trimp = (frac * 0.64 * np.exp(1.92 * frac)).sum()
+        strain = min(21.0, round(sensitivity * 1.9 * np.log1p(trimp / 0.5), 1))
+
+    total_steps = day_df['STEPS'].sum() if not day_df.empty and 'STEPS' in day_df.columns else 0
+    avg_hr = day_df['HEART_RATE'].mean() if not day_df.empty and 'HEART_RATE' in day_df.columns else np.nan
+
+    return {"strain_score": strain, "total_steps": total_steps, "avg_hr": avg_hr,
+            "hrv_val": sleep_info["hrv_val"], "sleep_duration_mins": sleep_info["sleep_duration_mins"]}
+
+
+# --- Daily Journal: simple per-day txt logs + trend comparisons ----------------------------
+JOURNAL_DIR = "journal"
+
+
+def _journal_path(d):
+    return os.path.join(JOURNAL_DIR, f"{d.isoformat()}.txt")
+
+
+def load_journal_entry(d):
+    path = _journal_path(d)
+    tags, notes = {}, ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        in_notes = False
+        notes_lines = []
+        for line in lines:
+            if in_notes:
+                notes_lines.append(line)
+                continue
+            if line.strip().startswith("Notes:"):
+                in_notes = True
+                rest = line.split(":", 1)[1].strip()
+                if rest:
+                    notes_lines.append(rest)
+                continue
+            if ":" in line:
+                tag, val = line.split(":", 1)
+                tags[tag.strip()] = val.strip().lower() in ("yes", "true", "y", "1")
+        notes = "\n".join(notes_lines).strip()
+    return tags, notes
+
+
+def save_journal_entry(d, tag_values, notes):
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    lines = [f"{tag}: {'Yes' if val else 'No'}" for tag, val in tag_values.items()]
+    lines.append("Notes:")
+    if notes:
+        lines.append(notes)
+    with open(_journal_path(d), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def has_journal_entry(d):
+    return os.path.exists(_journal_path(d))
+
+
+
 if not df_activity.empty and 'Date' in df_activity.columns:
     available_dates = sorted(df_activity['Date'].dropna().unique(), reverse=True)
 else:
@@ -454,7 +547,7 @@ if available_dates:
 else:
     selected_date = datetime.now().date()
 
-# --- Everything else lives here, collapsed, out of the way --------------------------------
+# All other settings, collapsed by default.
 with st.sidebar.expander("⚙️ Advanced Settings"):
     if st.button("🔄 Force-refresh data"):
         st.cache_data.clear()
@@ -490,6 +583,10 @@ with st.sidebar.expander("⚙️ Advanced Settings"):
     st.text_input("Awake code(s), comma-separated (blank = none excluded)", key="awake_codes")
 
     st.divider()
+    st.caption("📔 Journal Tags (optional)")
+    st.text_area("Comma-separated list of yes/no tags to track each day", key="journal_tags", height=80)
+
+    st.divider()
     st.caption(f"Active Activity Source: `{activity_table}`")
     if active_sleep_table:
         st.caption(f"Sleep Source: `{active_sleep_table}`")
@@ -523,42 +620,11 @@ hr_data = target_df['HEART_RATE'].dropna() if not target_df.empty and "HEART_RAT
 avg_hr = hr_data.mean() if not hr_data.empty else np.nan
 peak_hr = hr_data.max() if not hr_data.empty else np.nan
 
-# Strain Score (0-21 scale), duration-weighted heart-rate-reserve load.
-# Whoop's own algorithm is proprietary and unpublished, so this instead uses the standard
-# Banister TRIMP formula: each minute's contribution depends on how far into heart-rate-reserve
-# it sits (exponentially weighted), summed across the day, then log-compressed to 0-21.
-# Refinements over a naive per-minute TRIMP sum:
-#  1. Resting HR defaults to the night's actual overnight HR (once available).
-#  2. Minutes are smoothed (rolling median) and gated: ordinary daytime HR drift from talking,
-#     digestion, or posture change doesn't count as load, only sustained genuine elevation does.
-#  3. "Today" for strain purposes starts at WAKE time, not midnight - matching how Whoop actually
-#     defines a day (sleep-to-sleep, not calendar-day). Testing against real data showed this
-#     matters: the hour or two of evening activity before falling asleep technically falls after
-#     midnight by clock time, but experientially belongs to the previous evening, not "today" -
-#     counting it was the actual cause of an inflated score on a day that was otherwise very quiet.
-STRAIN_ACTIVITY_GATE = 15  # bpm above resting before a minute counts toward strain load
-strain_score = 0.0
-if sleep_window_end is not None and pd.Timestamp(sleep_window_end).date() <= selected_date:
-    strain_window_floor = sleep_window_end
-else:
-    strain_window_floor = datetime.combine(selected_date, datetime.min.time())
-
-if not target_df.empty and 'Datetime' in target_df.columns:
-    strain_source_df = target_df[target_df['Datetime'] >= strain_window_floor]
-else:
-    strain_source_df = target_df
-strain_hr_data = strain_source_df['HEART_RATE'].dropna() if not strain_source_df.empty and 'HEART_RATE' in strain_source_df.columns else pd.Series(dtype=float)
-
-if not strain_hr_data.empty:
-    auto_resting = sleep_info["sleep_hr_median"] if pd.notna(sleep_info["sleep_hr_median"]) else strain_hr_data.quantile(0.10)
-    resting_hr = resting_hr_override if resting_hr_override > 0 else max(40.0, auto_resting)
-    hr_reserve = max(1.0, max_hr_override - resting_hr)
-
-    hr_smoothed = strain_hr_data.sort_index().rolling(5, min_periods=1, center=True).median()
-    active_hr = hr_smoothed[hr_smoothed >= (resting_hr + STRAIN_ACTIVITY_GATE)]
-    hrr_frac = ((active_hr - resting_hr) / hr_reserve).clip(lower=0, upper=1)
-    trimp = (hrr_frac * 0.64 * np.exp(1.92 * hrr_frac)).sum()  # ~1 sample per minute
-    strain_score = min(21.0, round(st.session_state.strain_sensitivity * 1.9 * np.log1p(trimp / 0.5), 1))
+strain_info = compute_strain_for_date(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                       st.session_state.deep_codes, st.session_state.light_codes,
+                                       st.session_state.rem_codes, st.session_state.awake_codes,
+                                       max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
+strain_score = strain_info["strain_score"]
 
 # Global Metric Hunter for SpO2 & Stress
 def fetch_global_metric(keywords):
@@ -649,6 +715,83 @@ with col8:
     if pd.notna(stress_val):
         label, note = classify_stress(stress_val)
         st.caption(f"{label} — {note}")
+
+st.divider()
+
+st.subheader("📔 Daily Journal")
+journal_tags = [t.strip() for t in st.session_state.journal_tags.replace("\n", ",").split(",") if t.strip()]
+existing_tags, existing_notes = load_journal_entry(selected_date)
+
+tag_values = {}
+if journal_tags:
+    cols = st.columns(4)
+    for i, tag in enumerate(journal_tags):
+        with cols[i % 4]:
+            tag_values[tag] = st.checkbox(tag, value=existing_tags.get(tag, False),
+                                           key=f"journal_{tag}_{selected_date.isoformat()}")
+else:
+    st.caption("No journal tags configured - add some in ⚙️ Advanced Settings.")
+
+notes_input = st.text_area("Notes", value=existing_notes, key=f"journal_notes_{selected_date.isoformat()}",
+                            placeholder="Anything else worth noting about today...")
+
+jc1, jc2 = st.columns([1, 4])
+with jc1:
+    if st.button("💾 Save Entry", key=f"journal_save_{selected_date.isoformat()}"):
+        save_journal_entry(selected_date, tag_values, notes_input)
+        st.rerun()
+with jc2:
+    if has_journal_entry(selected_date):
+        st.caption(f"✅ Entry saved for {selected_date.strftime('%b %d')} — stored at `journal/{selected_date.isoformat()}.txt`")
+    else:
+        st.caption("No entry saved yet for this day.")
+
+with st.expander("📈 Journal Insights: how your trends compare"):
+    journaled_dates = [d for d in available_dates if has_journal_entry(d)]
+    if len(journaled_dates) < 2:
+        st.caption("Log at least a couple of days (ideally with some variation - a tag marked Yes on some days, No on others) to start seeing comparisons here.")
+    else:
+        rows = []
+        for d in journaled_dates:
+            tags, _ = load_journal_entry(d)
+            s_info = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                              st.session_state.deep_codes, st.session_state.light_codes,
+                                              st.session_state.rem_codes, st.session_state.awake_codes,
+                                              max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
+            rows.append({"tags": tags, "strain": s_info["strain_score"], "hrv": s_info["hrv_val"],
+                         "sleep_mins": s_info["sleep_duration_mins"]})
+
+        all_tags = sorted({t for r in rows for t in r["tags"].keys()})
+
+        def _avg(key, rs):
+            vals = [r[key] for r in rs if pd.notna(r[key]) and r[key] != 0]
+            return np.mean(vals) if vals else np.nan
+
+        comparison_rows = []
+        for tag in all_tags:
+            yes_rows = [r for r in rows if r["tags"].get(tag) is True]
+            no_rows = [r for r in rows if r["tags"].get(tag) is False]
+            if not yes_rows or not no_rows:
+                continue
+            comparison_rows.append({
+                "Tag": tag, "n (Yes/No)": f"{len(yes_rows)}/{len(no_rows)}",
+                "Strain (Yes)": _avg("strain", yes_rows), "Strain (No)": _avg("strain", no_rows),
+                "HRV (Yes)": _avg("hrv", yes_rows), "HRV (No)": _avg("hrv", no_rows),
+                "Sleep (Yes)": _avg("sleep_mins", yes_rows), "Sleep (No)": _avg("sleep_mins", no_rows),
+            })
+
+        if not comparison_rows:
+            st.caption("Not enough variation yet - each tag needs at least one 'Yes' day and one 'No' day to compare.")
+        else:
+            comp_df = pd.DataFrame(comparison_rows)
+            for col in ["Sleep (Yes)", "Sleep (No)"]:
+                comp_df[col] = comp_df[col].apply(lambda m: f"{int(m // 60)}h {int(m % 60)}m" if pd.notna(m) else "—")
+            for col in ["Strain (Yes)", "Strain (No)"]:
+                comp_df[col] = comp_df[col].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+            for col in ["HRV (Yes)", "HRV (No)"]:
+                comp_df[col] = comp_df[col].apply(lambda v: f"{int(v)} ms" if pd.notna(v) else "—")
+            st.dataframe(comp_df, hide_index=True, width='stretch')
+            st.caption("Based only on days you've journaled. Small sample sizes mean these are early signals, not firm conclusions - the more days you log, the more this tells you.")
 
 st.divider()
 
