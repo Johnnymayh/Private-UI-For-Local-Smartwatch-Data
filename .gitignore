@@ -1,0 +1,24 @@
+# Your personal health data - NEVER commit this
+Gadgetbridge
+Gadgetbridge-wal
+Gadgetbridge-shm
+Gadgetbridge-journal
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
