@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import numpy as np
 import streamlit as st
+import altair as alt
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 
@@ -64,6 +65,15 @@ _DEFAULTS = {
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+if st.session_state.get("_pending_new_journal_tag"):
+    _new_tag = st.session_state.pop("_pending_new_journal_tag").strip()
+    _existing = [t.strip() for t in st.session_state.journal_tags.replace("\n", ",").split(",") if t.strip()]
+    if _new_tag and _new_tag not in _existing:
+        _existing.append(_new_tag)
+        st.session_state.journal_tags = ", ".join(_existing)
+    if "new_journal_tag_input" in st.session_state:
+        del st.session_state["new_journal_tag_input"]
 
 LOCAL_TZ = get_local_tz(st.session_state.tz_name)
 
@@ -527,20 +537,23 @@ else:
     available_dates = []
 
 if available_dates:
-    hrv_by_date = {}
+    day_info_by_date = {}
     with st.spinner("Loading history..."):
         for d in available_dates:
-            info = compute_sleep_and_hrv(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                                          st.session_state.deep_codes, st.session_state.light_codes,
-                                          st.session_state.rem_codes, st.session_state.awake_codes)
-            hrv_by_date[d] = info["hrv_val"]
+            day_info_by_date[d] = compute_strain_for_date(
+                d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                st.session_state.deep_codes, st.session_state.light_codes,
+                st.session_state.rem_codes, st.session_state.awake_codes,
+                st.session_state.max_hr_override, st.session_state.resting_hr_override, st.session_state.strain_sensitivity)
 
-    st.sidebar.caption("🗓️ Date — Overnight HRV")
+    st.sidebar.caption("🗓️ Date — Strain / HRV")
 
     def _fmt_date(d):
-        hrv = hrv_by_date.get(d)
-        hrv_str = f"{int(hrv)} ms" if pd.notna(hrv) else "—"
-        return f"{d.strftime('%a %d %b')}  —  {hrv_str}"
+        info = day_info_by_date.get(d, {})
+        strain, hrv = info.get("strain_score"), info.get("hrv_val")
+        strain_str = f"{strain:.1f}" if pd.notna(strain) else "—"
+        hrv_str = f"{int(hrv)}ms" if pd.notna(hrv) else "—"
+        return f"{d.strftime('%a %d %b')}  —  🔥{strain_str}  ⚡{hrv_str}"
 
     selected_date = st.sidebar.radio("Select a day to analyze", available_dates, format_func=_fmt_date,
                                       label_visibility="collapsed")
@@ -718,19 +731,47 @@ with col8:
 
 st.divider()
 
+st.subheader(f"⏳ Intraday Heart Rate ({selected_date.strftime('%b %d')})")
+if not hr_data.empty:
+    st.line_chart(target_df.set_index('Datetime')['HEART_RATE'], color="#ff4b4b")
+else:
+    st.info("No intraday heart rate data available for this specific date.")
+
+st.subheader("👟 7-Day Step Trend")
+if not last_7_days.empty and "STEPS" in last_7_days.columns and last_7_days['STEPS'].sum() > 0:
+    daily_steps = last_7_days.groupby(last_7_days['Date'])['STEPS'].sum().reset_index()
+    daily_steps['Day'] = daily_steps['Date'].apply(lambda d: d.strftime('%a %d'))
+    step_chart = alt.Chart(daily_steps).mark_bar(color="#29b5e8").encode(
+        x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('STEPS:Q', title='Steps'),
+        tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip('STEPS:Q', title='Steps')],
+    ).properties(height=280)
+    st.altair_chart(step_chart, width='stretch')
+else:
+    st.info("No step data available.")
+
+st.divider()
+
 st.subheader("📔 Daily Journal")
 journal_tags = [t.strip() for t in st.session_state.journal_tags.replace("\n", ",").split(",") if t.strip()]
 existing_tags, existing_notes = load_journal_entry(selected_date)
 
 tag_values = {}
-if journal_tags:
-    cols = st.columns(4)
-    for i, tag in enumerate(journal_tags):
-        with cols[i % 4]:
-            tag_values[tag] = st.checkbox(tag, value=existing_tags.get(tag, False),
-                                           key=f"journal_{tag}_{selected_date.isoformat()}")
-else:
-    st.caption("No journal tags configured - add some in ⚙️ Advanced Settings.")
+n_cols = 4
+cols = st.columns(n_cols)
+for i, tag in enumerate(journal_tags):
+    with cols[i % n_cols]:
+        tag_values[tag] = st.checkbox(tag, value=existing_tags.get(tag, False),
+                                       key=f"journal_{tag}_{selected_date.isoformat()}")
+with cols[len(journal_tags) % n_cols]:
+    with st.popover("➕ Add tag"):
+        new_tag_input = st.text_input("New tag name", key="new_journal_tag_input")
+        if st.button("Add", key="add_journal_tag_btn") and new_tag_input.strip():
+            st.session_state["_pending_new_journal_tag"] = new_tag_input.strip()
+            st.rerun()
+
+if not journal_tags:
+    st.caption("No journal tags yet - use the ➕ button above to add one, or set a list in ⚙️ Advanced Settings.")
 
 notes_input = st.text_area("Notes", value=existing_notes, key=f"journal_notes_{selected_date.isoformat()}",
                             placeholder="Anything else worth noting about today...")
@@ -767,17 +808,40 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             vals = [r[key] for r in rs if pd.notna(r[key]) and r[key] != 0]
             return np.mean(vals) if vals else np.nan
 
+        # Tags rarely happen in isolation - if Alcohol and Meditate almost always co-occur,
+        # a plain "Meditate Yes vs No" comparison is really measuring both at once. This finds,
+        # for each tag, any other tag it's strongly correlated with across journaled days, so
+        # that can be flagged rather than silently baked into the number.
+        def _tag_correlation(tag_a, tag_b):
+            pairs = [(r["tags"][tag_a], r["tags"][tag_b]) for r in rows if tag_a in r["tags"] and tag_b in r["tags"]]
+            if len(pairs) < 3:
+                return None
+            xs = np.array([1.0 if p[0] else 0.0 for p in pairs])
+            ys = np.array([1.0 if p[1] else 0.0 for p in pairs])
+            if xs.std() == 0 or ys.std() == 0:
+                return None
+            return float(np.corrcoef(xs, ys)[0, 1])
+
+        CONFOUND_THRESHOLD = 0.5
+        confounds = {}
+        for tag in all_tags:
+            found = [(other, c) for other in all_tags if other != tag
+                     for c in [_tag_correlation(tag, other)] if c is not None and abs(c) >= CONFOUND_THRESHOLD]
+            confounds[tag] = sorted(found, key=lambda x: -abs(x[1]))
+
         comparison_rows = []
         for tag in all_tags:
             yes_rows = [r for r in rows if r["tags"].get(tag) is True]
             no_rows = [r for r in rows if r["tags"].get(tag) is False]
             if not yes_rows or not no_rows:
                 continue
+            correlated = ", ".join(f"{o} ({'+' if c > 0 else '−'}{abs(c):.1f})" for o, c in confounds.get(tag, [])[:2])
             comparison_rows.append({
                 "Tag": tag, "n (Yes/No)": f"{len(yes_rows)}/{len(no_rows)}",
                 "Strain (Yes)": _avg("strain", yes_rows), "Strain (No)": _avg("strain", no_rows),
                 "HRV (Yes)": _avg("hrv", yes_rows), "HRV (No)": _avg("hrv", no_rows),
                 "Sleep (Yes)": _avg("sleep_mins", yes_rows), "Sleep (No)": _avg("sleep_mins", no_rows),
+                "Correlated With": correlated or "—",
             })
 
         if not comparison_rows:
@@ -791,22 +855,39 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             for col in ["HRV (Yes)", "HRV (No)"]:
                 comp_df[col] = comp_df[col].apply(lambda v: f"{int(v)} ms" if pd.notna(v) else "—")
             st.dataframe(comp_df, hide_index=True, width='stretch')
-            st.caption("Based only on days you've journaled. Small sample sizes mean these are early signals, not firm conclusions - the more days you log, the more this tells you.")
+            st.caption("\"Correlated With\" flags tags that tend to happen together in your logs (+ means together, − means opposite), "
+                       "so a strong number there might really belong to the correlated tag, not this one. See below to help tell them apart.")
 
-st.divider()
+            st.markdown("**🔍 Controlled comparisons**")
+            st.caption("Holding a correlated tag fixed at 'No' isolates the other tag's effect on those days specifically - "
+                       "e.g. does Alcohol still look bad on days you also didn't meditate?")
+            shown_pairs = set()
+            any_controlled = False
+            for tag in all_tags:
+                for other, corr in confounds.get(tag, []):
+                    pair_key = (tag, other)
+                    if pair_key in shown_pairs:
+                        continue
+                    stratum = [r for r in rows if r["tags"].get(other) is False]
+                    yes_s = [r for r in stratum if r["tags"].get(tag) is True]
+                    no_s = [r for r in stratum if r["tags"].get(tag) is False]
+                    if not yes_s or not no_s:
+                        continue
+                    shown_pairs.add(pair_key)
+                    any_controlled = True
+                    s_yes, s_no = _avg("strain", yes_s), _avg("strain", no_s)
+                    h_yes, h_no = _avg("hrv", yes_s), _avg("hrv", no_s)
+                    line = f"**{tag}** vs no {tag}, on days without **{other}** (n={len(yes_s)}/{len(no_s)}): "
+                    parts = []
+                    if pd.notna(s_yes) and pd.notna(s_no):
+                        parts.append(f"Strain {s_yes:.1f} vs {s_no:.1f}")
+                    if pd.notna(h_yes) and pd.notna(h_no):
+                        parts.append(f"HRV {int(h_yes)}ms vs {int(h_no)}ms")
+                    st.markdown(line + ", ".join(parts) if parts else line + "not enough data")
+            if not any_controlled:
+                st.caption("No controlled comparisons available yet - need days where a correlated tag stays constant while the other one varies.")
 
-st.subheader(f"⏳ Intraday Heart Rate ({selected_date.strftime('%b %d')})")
-if not hr_data.empty:
-    st.line_chart(target_df.set_index('Datetime')['HEART_RATE'], color="#ff4b4b")
-else:
-    st.info("No intraday heart rate data available for this specific date.")
 
-st.subheader("👟 7-Day Step Trend")
-if not last_7_days.empty and "STEPS" in last_7_days.columns and last_7_days['STEPS'].sum() > 0:
-    daily_steps = last_7_days.groupby(last_7_days['Date'])['STEPS'].sum().reset_index()
-    st.bar_chart(daily_steps.set_index('Date')['STEPS'], color="#29b5e8")
-else:
-    st.info("No step data available.")
 
 with st.expander("⚙️ Database Transparency & Sleep Table Inspector"):
     st.write(f"Active Activity Table: `{activity_table}` | Active Sleep Table: `{active_sleep_table if active_sleep_table else 'None'}`")
