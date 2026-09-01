@@ -60,20 +60,10 @@ _DEFAULTS = {
     "rem_codes": "4",
     "awake_codes": "",
     "sleep_table_override": "Auto-Detect",
-    "journal_tags": "Alcohol, Caffeine (evening), Drugs/Medication, Fish, Late Meal, Screen Before Bed, Stretching/Yoga, Travel, Feeling Sick, High Stress Day",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
-
-if st.session_state.get("_pending_new_journal_tag"):
-    _new_tag = st.session_state.pop("_pending_new_journal_tag").strip()
-    _existing = [t.strip() for t in st.session_state.journal_tags.replace("\n", ",").split(",") if t.strip()]
-    if _new_tag and _new_tag not in _existing:
-        _existing.append(_new_tag)
-        st.session_state.journal_tags = ", ".join(_existing)
-    if "new_journal_tag_input" in st.session_state:
-        del st.session_state["new_journal_tag_input"]
 
 LOCAL_TZ = get_local_tz(st.session_state.tz_name)
 
@@ -485,6 +475,25 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
 
 # --- Daily Journal: simple per-day txt logs + trend comparisons ----------------------------
 JOURNAL_DIR = "journal"
+JOURNAL_TAGS_FILE = os.path.join(JOURNAL_DIR, "_tags.txt")
+DEFAULT_JOURNAL_TAGS = ["Alcohol", "Caffeine (evening)", "Drugs/Medication", "Fish", "Late Meal",
+                        "Screen Before Bed", "Stretching/Yoga", "Travel", "Feeling Sick", "High Stress Day"]
+
+
+def load_journal_tags():
+    if os.path.exists(JOURNAL_TAGS_FILE):
+        with open(JOURNAL_TAGS_FILE, "r", encoding="utf-8") as f:
+            tags = [line.strip() for line in f.read().split("\n") if line.strip()]
+        if tags:
+            return tags
+    save_journal_tags(DEFAULT_JOURNAL_TAGS)
+    return list(DEFAULT_JOURNAL_TAGS)
+
+
+def save_journal_tags(tags):
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    with open(JOURNAL_TAGS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(tags))
 
 
 def _journal_path(d):
@@ -594,10 +603,6 @@ with st.sidebar.expander("⚙️ Advanced Settings"):
     st.text_input("Light sleep code(s)", key="light_codes")
     st.text_input("REM sleep code(s)", key="rem_codes")
     st.text_input("Awake code(s), comma-separated (blank = none excluded)", key="awake_codes")
-
-    st.divider()
-    st.caption("📔 Journal Tags (optional)")
-    st.text_area("Comma-separated list of yes/no tags to track each day", key="journal_tags", height=80)
 
     st.divider()
     st.caption(f"Active Activity Source: `{activity_table}`")
@@ -731,12 +736,6 @@ with col8:
 
 st.divider()
 
-st.subheader(f"⏳ Intraday Heart Rate ({selected_date.strftime('%b %d')})")
-if not hr_data.empty:
-    st.line_chart(target_df.set_index('Datetime')['HEART_RATE'], color="#ff4b4b")
-else:
-    st.info("No intraday heart rate data available for this specific date.")
-
 st.subheader("👟 7-Day Step Trend")
 if not last_7_days.empty and "STEPS" in last_7_days.columns and last_7_days['STEPS'].sum() > 0:
     daily_steps = last_7_days.groupby(last_7_days['Date'])['STEPS'].sum().reset_index()
@@ -753,7 +752,7 @@ else:
 st.divider()
 
 st.subheader("📔 Daily Journal")
-journal_tags = [t.strip() for t in st.session_state.journal_tags.replace("\n", ",").split(",") if t.strip()]
+journal_tags = load_journal_tags()
 existing_tags, existing_notes = load_journal_entry(selected_date)
 
 tag_values = {}
@@ -764,14 +763,30 @@ for i, tag in enumerate(journal_tags):
         tag_values[tag] = st.checkbox(tag, value=existing_tags.get(tag, False),
                                        key=f"journal_{tag}_{selected_date.isoformat()}")
 with cols[len(journal_tags) % n_cols]:
-    with st.popover("➕ Add tag"):
-        new_tag_input = st.text_input("New tag name", key="new_journal_tag_input")
+    with st.popover("🏷️ Manage tags"):
+        st.caption("Add a new tag")
+        new_tag_input = st.text_input("New tag name", key="new_journal_tag_input", label_visibility="collapsed",
+                                       placeholder="e.g. Cold Plunge")
         if st.button("Add", key="add_journal_tag_btn") and new_tag_input.strip():
-            st.session_state["_pending_new_journal_tag"] = new_tag_input.strip()
-            st.rerun()
+            if new_tag_input.strip() not in journal_tags:
+                save_journal_tags(journal_tags + [new_tag_input.strip()])
+                st.rerun()
+
+        if journal_tags:
+            st.divider()
+            st.caption("Remove a tag - not relevant to you? Drop it, e.g. Alcohol if you never drink")
+            for t in journal_tags:
+                rc1, rc2 = st.columns([4, 1])
+                with rc1:
+                    st.write(t)
+                with rc2:
+                    if st.button("✕", key=f"remove_tag_{t}"):
+                        save_journal_tags([x for x in journal_tags if x != t])
+                        st.rerun()
+        st.caption("Removing a tag only stops tracking it going forward - past logged entries keep their data.")
 
 if not journal_tags:
-    st.caption("No journal tags yet - use the ➕ button above to add one, or set a list in ⚙️ Advanced Settings.")
+    st.caption("No journal tags yet - use 🏷️ Manage tags above to add one.")
 
 notes_input = st.text_area("Notes", value=existing_notes, key=f"journal_notes_{selected_date.isoformat()}",
                             placeholder="Anything else worth noting about today...")
@@ -887,7 +902,13 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             if not any_controlled:
                 st.caption("No controlled comparisons available yet - need days where a correlated tag stays constant while the other one varies.")
 
+st.divider()
 
+st.subheader(f"⏳ Intraday Heart Rate ({selected_date.strftime('%b %d')})")
+if not hr_data.empty:
+    st.line_chart(target_df.set_index('Datetime')['HEART_RATE'], color="#ff4b4b")
+else:
+    st.info("No intraday heart rate data available for this specific date.")
 
 with st.expander("⚙️ Database Transparency & Sleep Table Inspector"):
     st.write(f"Active Activity Table: `{activity_table}` | Active Sleep Table: `{active_sleep_table if active_sleep_table else 'None'}`")
