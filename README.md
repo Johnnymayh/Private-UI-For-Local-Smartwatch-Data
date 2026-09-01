@@ -60,11 +60,6 @@ they may need adjusting for other devices. Open **⚙️ Advanced Settings** in 
   Transparency"** on the main page for a duration-per-raw-code breakdown, compare it against
   Gadgetbridge's own sleep report, and enter the correct codes here.
 
-## Privacy
-
-Your `Gadgetbridge` export contains real health data (heart rate, sleep, location-adjacent
-timestamps). `.gitignore` already excludes it  **double-check `git status` before your
-first commit** to be sure it was never staged.
 
 ## License
 
