@@ -814,8 +814,18 @@ with st.expander("📈 Journal Insights: how your trends compare"):
                                               st.session_state.deep_codes, st.session_state.light_codes,
                                               st.session_state.rem_codes, st.session_state.awake_codes,
                                               max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
-            rows.append({"tags": tags, "strain": s_info["strain_score"], "hrv": s_info["hrv_val"],
-                         "sleep_mins": s_info["sleep_duration_mins"]})
+            # Strain is wake-anchored and accumulates through day d, so it reflects day d itself.
+            # HRV/Sleep for "day d" on the dashboard are actually from the night ENDING that morning -
+            # i.e. they reflect what happened the evening before. What a tag logged for day d (say,
+            # alcohol that evening) actually affects is the night that FOLLOWS d, reported as day d+1's
+            # numbers. Pull those instead so the comparison lines up with the right night.
+            next_day_info = compute_strain_for_date(d + timedelta(days=1), activity_table, active_sleep_table, _db_mtime(),
+                                                      st.session_state.tz_name, st.session_state.deep_codes,
+                                                      st.session_state.light_codes, st.session_state.rem_codes,
+                                                      st.session_state.awake_codes, max_hr_override, resting_hr_override,
+                                                      st.session_state.strain_sensitivity)
+            rows.append({"tags": tags, "strain": s_info["strain_score"], "hrv": next_day_info["hrv_val"],
+                         "sleep_mins": next_day_info["sleep_duration_mins"]})
 
         all_tags = sorted({t for r in rows for t in r["tags"].keys()})
 
@@ -853,9 +863,9 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             correlated = ", ".join(f"{o} ({'+' if c > 0 else '−'}{abs(c):.1f})" for o, c in confounds.get(tag, [])[:2])
             comparison_rows.append({
                 "Tag": tag, "n (Yes/No)": f"{len(yes_rows)}/{len(no_rows)}",
-                "Strain (Yes)": _avg("strain", yes_rows), "Strain (No)": _avg("strain", no_rows),
-                "HRV (Yes)": _avg("hrv", yes_rows), "HRV (No)": _avg("hrv", no_rows),
-                "Sleep (Yes)": _avg("sleep_mins", yes_rows), "Sleep (No)": _avg("sleep_mins", no_rows),
+                "Strain that day (Yes)": _avg("strain", yes_rows), "Strain that day (No)": _avg("strain", no_rows),
+                "HRV that night (Yes)": _avg("hrv", yes_rows), "HRV that night (No)": _avg("hrv", no_rows),
+                "Sleep that night (Yes)": _avg("sleep_mins", yes_rows), "Sleep that night (No)": _avg("sleep_mins", no_rows),
                 "Correlated With": correlated or "—",
             })
 
@@ -863,13 +873,17 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             st.caption("Not enough variation yet - each tag needs at least one 'Yes' day and one 'No' day to compare.")
         else:
             comp_df = pd.DataFrame(comparison_rows)
-            for col in ["Sleep (Yes)", "Sleep (No)"]:
+            for col in ["Sleep that night (Yes)", "Sleep that night (No)"]:
                 comp_df[col] = comp_df[col].apply(lambda m: f"{int(m // 60)}h {int(m % 60)}m" if pd.notna(m) else "—")
-            for col in ["Strain (Yes)", "Strain (No)"]:
+            for col in ["Strain that day (Yes)", "Strain that day (No)"]:
                 comp_df[col] = comp_df[col].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
-            for col in ["HRV (Yes)", "HRV (No)"]:
+            for col in ["HRV that night (Yes)", "HRV that night (No)"]:
                 comp_df[col] = comp_df[col].apply(lambda v: f"{int(v)} ms" if pd.notna(v) else "—")
             st.dataframe(comp_df, hide_index=True, width='stretch')
+            st.caption("Strain reflects the day itself (from when you woke up). HRV and Sleep reflect the night that "
+                       "*followed* that day, since that's the sleep your logged behavior would actually have affected - "
+                       "e.g. Alcohol logged for the 5th is compared against your HRV on the night of the 5th→6th, not the "
+                       "night before it.")
             st.caption("\"Correlated With\" flags tags that tend to happen together in your logs (+ means together, − means opposite), "
                        "so a strong number there might really belong to the correlated tag, not this one. See below to help tell them apart.")
 
