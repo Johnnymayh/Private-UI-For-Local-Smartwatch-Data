@@ -55,10 +55,6 @@ _DEFAULTS = {
     "max_hr_override": 190,
     "resting_hr_override": 0,
     "strain_sensitivity": 1.0,
-    "deep_codes": "3",
-    "light_codes": "2",
-    "rem_codes": "4",
-    "awake_codes": "",
     "sleep_table_override": "Auto-Detect",
 }
 for _k, _v in _DEFAULTS.items():
@@ -191,74 +187,83 @@ df_activity = get_cleaned_activity_df(activity_table, _db_mtime(), st.session_st
 # Sleep + HRV engine. Runs per-date so it can power both the main dashboard and the
 # sidebar's per-day HRV list.
 
-def classify_stage(raw, deep_codes, light_codes, rem_codes, awake_codes):
-    """Map a raw stage code/label to a bucket using the sidebar-configured code sets
-    (exact match - Xiaomi's numeric encoding isn't publicly documented and a loose
-    substring match like '3' in '13' would misfire). Also accepts textual labels."""
-    s = str(raw).strip().upper()
-    if s in deep_codes or "DEEP" in s:
-        return "deep"
-    if s in light_codes or "LIGHT" in s:
-        return "light"
-    if s in rem_codes or "REM" in s:
-        return "rem"
-    if s in awake_codes or "AWAKE" in s or "WAKE" in s:
-        return "awake"
-    return "other"
-
-
-def _parse_codes(s):
-    return {c.strip().upper() for c in s.split(",") if c.strip()}
-
-
 MIN_SLEEP_BLOCK_HOURS = 2.0
 
 
 def detect_sleep_from_raw_kind(activity_df, w_start, w_end, baseline_hr):
-    """Find the longest contiguous same-RAW_KIND run overnight with resting-level HR. Far more
-    reliable on Huami/Xiaomi devices than a raw 'SLEEP' column, which can be a noisy counter
-    rather than a boolean. Doesn't hardcode which code means sleep - it varies by device."""
+    """Find the sleep session overnight from per-minute activity-kind codes. Far more reliable
+    on Huami/Xiaomi devices than a raw 'SLEEP' column, which can be a noisy counter rather than
+    a boolean. Doesn't hardcode which code means sleep - it varies by device.
+
+    A single longest-contiguous-block approach undercounts real sleep: a brief nighttime
+    awakening (bathroom trip, checking the time) splits one sleep session into two blocks, and
+    picking only the longer one silently drops the other, reporting the wrong start or end time.
+    This instead finds the best "core" block, then merges in any other resting-HR block within
+    a short gap of it, regardless of its exact code, extending the session outward."""
     if 'RAW_KIND' not in activity_df.columns or 'Datetime' not in activity_df.columns:
         return None
-    window_df = activity_df[(activity_df['Datetime'] >= w_start) & (activity_df['Datetime'] <= w_end)].sort_values('Datetime')
+    window_df = activity_df[(activity_df['Datetime'] >= w_start) & (activity_df['Datetime'] <= w_end)].sort_values('Datetime').reset_index(drop=True)
     if window_df.empty:
         return None
-    blocks = (window_df['RAW_KIND'] != window_df['RAW_KIND'].shift()).cumsum()
-    candidates = []
-    for _, g in window_df.groupby(blocks):
-        if len(g) < 30:
-            continue
+
+    block_ids = (window_df['RAW_KIND'] != window_df['RAW_KIND'].shift()).cumsum()
+    blocks = []
+    for _, g in window_df.groupby(block_ids):
         gaps = g['Datetime'].diff().dt.total_seconds().dropna() / 60.0
         sample_width = gaps.median() if not gaps.empty else 1.0
         span_min = (g['Datetime'].max() - g['Datetime'].min()).total_seconds() / 60.0 + (sample_width if pd.notna(sample_width) else 1.0)
-        if span_min < MIN_SLEEP_BLOCK_HOURS * 60:
-            continue
         avg_hr = g['HEART_RATE'].mean()
-        candidates.append({"raw_kind": g['RAW_KIND'].iloc[0], "start": g['Datetime'].min(), "end": g['Datetime'].max(),
-                            "span_min": span_min, "avg_hr": avg_hr, "n": len(g)})
+        is_resting = pd.isna(baseline_hr) or pd.isna(avg_hr) or avg_hr <= baseline_hr
+        blocks.append({"raw_kind": g['RAW_KIND'].iloc[0], "start": g['Datetime'].min(), "end": g['Datetime'].max(),
+                        "span_min": span_min, "avg_hr": avg_hr, "n": len(g), "resting": is_resting})
+
+    candidates = [b for b in blocks if b["span_min"] >= MIN_SLEEP_BLOCK_HOURS * 60 and b["resting"]]
     if not candidates:
         return None
     candidates.sort(key=lambda c: -c["span_min"])
-    best = candidates[0]
-    if pd.notna(baseline_hr) and pd.notna(best["avg_hr"]) and best["avg_hr"] > baseline_hr:
-        return None
-    return best
+    core = candidates[0]
+
+    MERGE_GAP_MINUTES = 60          # brief awakenings within this gap get folded into the same session
+    MAX_FOREIGN_BLOCK_MINUTES = 15  # a different-code block only merges if it's itself this short -
+                                     # a brief transitional blip, not a separate resting-but-awake period
+    merged_start, merged_end = core["start"], core["end"]
+    used = {id(core)}
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if id(b) in used or not b["resting"]:
+                continue
+            if b["raw_kind"] != core["raw_kind"] and b["span_min"] > MAX_FOREIGN_BLOCK_MINUTES:
+                continue
+            gap_before = (merged_start - b["end"]).total_seconds() / 60.0
+            gap_after = (b["start"] - merged_end).total_seconds() / 60.0
+            if 0 <= gap_before <= MERGE_GAP_MINUTES:
+                merged_start = min(merged_start, b["start"])
+                used.add(id(b))
+                changed = True
+            elif 0 <= gap_after <= MERGE_GAP_MINUTES:
+                merged_end = max(merged_end, b["end"])
+                used.add(id(b))
+                changed = True
+
+    merged_rows = window_df[(window_df['Datetime'] >= merged_start) & (window_df['Datetime'] <= merged_end)]
+    return {"raw_kind": core["raw_kind"], "start": merged_start, "end": merged_end,
+            "span_min": (merged_end - merged_start).total_seconds() / 60.0,
+            "avg_hr": merged_rows['HEART_RATE'].mean() if not merged_rows.empty else core["avg_hr"],
+            "n": len(merged_rows)}
 
 
 @st.cache_data
-def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name,
-                           deep_codes_str, light_codes_str, rem_codes_str, awake_codes_str):
+def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name):
     """Everything needed to report sleep + HRV for a single date. Cached per (date, settings)
     so the sidebar can call this once per day in the history list without recomputing on every
     rerun, and the main dashboard reuses the exact same cached result for the selected date."""
     tz = get_local_tz(tz_name)
     activity_df = get_cleaned_activity_df(activity_table, mtime, tz_name) if activity_table else pd.DataFrame()
-    deep_codes, light_codes, rem_codes, awake_codes = (
-        _parse_codes(deep_codes_str), _parse_codes(light_codes_str), _parse_codes(rem_codes_str), _parse_codes(awake_codes_str)
-    )
 
     result = {
-        "sleep_duration_mins": 0, "deep_sleep_mins": 0, "light_sleep_mins": 0, "rem_sleep_mins": 0,
+        "sleep_duration_mins": 0,
         "sleep_start_str": "N/A", "sleep_end_str": "N/A",
         "sleep_window_start": None, "sleep_window_end": None,
         "sleep_hr_median": np.nan,
@@ -280,10 +285,8 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
             df_sleep = df_sleep.copy()
             df_sleep.columns = df_sleep.columns.str.upper()
             time_c = next((c for c in df_sleep.columns if any(k in c for k in ["TIMESTAMP", "TIME", "START", "DATE", "FROM"])), None)
-            stage_col = next((c for c in df_sleep.columns if any(k in c for k in ["STAGE", "MODE", "KIND", "VALUE", "STATE", "TYPE"])), None)
             sleep_diag["table"] = active_sleep_table
             sleep_diag["total_rows"] = len(df_sleep)
-            sleep_diag["stage_col"] = stage_col
 
             if time_c:
                 try:
@@ -314,27 +317,7 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
                         if pd.isna(median_gap) or median_gap <= 0:
                             median_gap = 1.0
                         gaps_min = gaps_min.fillna(median_gap).clip(lower=0, upper=120)
-
-                        stage_durations = {}
-                        for d_val, raw_stage in zip(gaps_min, day_sleep[stage_col] if stage_col else [None] * len(day_sleep)):
-                            code_label = str(raw_stage) if stage_col and pd.notna(raw_stage) else "(none)"
-                            stage_durations[code_label] = stage_durations.get(code_label, 0.0) + d_val
-                            bucket = classify_stage(raw_stage, deep_codes, light_codes, rem_codes, awake_codes) if stage_col and pd.notna(raw_stage) else "other"
-                            if bucket == "deep":
-                                result["deep_sleep_mins"] += d_val
-                                result["sleep_duration_mins"] += d_val
-                            elif bucket == "light":
-                                result["light_sleep_mins"] += d_val
-                                result["sleep_duration_mins"] += d_val
-                            elif bucket == "rem":
-                                result["rem_sleep_mins"] += d_val
-                                result["sleep_duration_mins"] += d_val
-                            elif bucket == "awake":
-                                pass
-                            else:
-                                result["sleep_duration_mins"] += d_val
-
-                        sleep_diag["minutes_per_raw_code"] = {k: round(v, 1) for k, v in sorted(stage_durations.items(), key=lambda kv: -kv[1])}
+                        result["sleep_duration_mins"] = float(gaps_min.sum())
 
                         s_min, e_max = day_sleep['Sleep_DT'].min(), day_sleep['Sleep_DT'].max()
                         result["sleep_window_start"], result["sleep_window_end"] = s_min, e_max
@@ -364,13 +347,12 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
                 sleep_hr_data = window_df_block['HEART_RATE'].dropna()
                 if not sleep_hr_data.empty:
                     result["hrv_source"] = "sleep"
-            sleep_diag["source"] = "activity_table_raw_kind_total_only"
+            sleep_diag["source"] = "activity_table_raw_kind"
             sleep_diag["raw_kind_detected"] = int(block["raw_kind"]) if pd.notna(block["raw_kind"]) else None
             sleep_diag["raw_kind_block_avg_hr"] = round(float(block["avg_hr"]), 1) if pd.notna(block["avg_hr"]) else None
-            sleep_diag["note"] = (f"Dedicated sleep-stage table had no data for this night, so this total comes from the longest "
-                                   f"contiguous RAW_KIND={sleep_diag['raw_kind_detected']} block on the activity table "
-                                   f"(avg {sleep_diag['raw_kind_block_avg_hr']} bpm vs {day_baseline_hr:.0f} bpm day average). "
-                                   "Deep/Light/REM breakdown isn't available from this source, total duration only.")
+            sleep_diag["note"] = (f"Dedicated sleep-stage table had no data for this night, so this comes from the "
+                                   f"RAW_KIND={sleep_diag['raw_kind_detected']} activity-kind block on the activity table "
+                                   f"(avg {sleep_diag['raw_kind_block_avg_hr']} bpm vs {day_baseline_hr:.0f} bpm day average).")
         else:
             general_col = next((c for c in activity_df.columns if c == "SLEEP"), None)
             if general_col:
@@ -402,13 +384,18 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
                             sleep_diag["source"] = "activity_table_fallback_total_only"
                             sleep_diag["note"] = "Total-only estimate from the activity table's SLEEP flag - treat as approximate."
 
-    # Resting-proxy HRV fallback if no real sleep HR was found at all
+    # Resting-proxy HRV fallback: only used when no real sleep window was found at all, and only
+    # trusted with a reasonably large sample - a sparse partial day (e.g. the band was only just
+    # paired that afternoon) was producing a confident-looking HRV number from a handful of
+    # arbitrary low readings that weren't remotely representative of actual rest.
+    RESTING_PROXY_MIN_SAMPLES = 30
     if sleep_hr_data.empty and not activity_df.empty and 'Date' in activity_df.columns:
         day_df = activity_df[activity_df['Date'] == target_date]
         hr_clean = day_df['HEART_RATE'].dropna() if 'HEART_RATE' in day_df.columns else pd.Series(dtype=float)
-        if not hr_clean.empty:
-            sleep_hr_data = hr_clean[hr_clean <= hr_clean.quantile(0.25)]
-            if not sleep_hr_data.empty:
+        if len(hr_clean) >= RESTING_PROXY_MIN_SAMPLES:
+            candidate = hr_clean[hr_clean <= hr_clean.quantile(0.25)]
+            if len(candidate) >= 6:
+                sleep_hr_data = candidate
                 result["hrv_source"] = "resting_proxy"
 
     if not sleep_hr_data.empty:
@@ -430,7 +417,6 @@ STRAIN_ACTIVITY_GATE = 15  # bpm above resting before a minute counts toward str
 
 @st.cache_data
 def compute_strain_for_date(target_date, activity_table, active_sleep_table, mtime, tz_name,
-                             deep_codes_str, light_codes_str, rem_codes_str, awake_codes_str,
                              max_hr_override, resting_hr_override, sensitivity):
     """Day Strain (0-21): duration-weighted heart-rate-reserve load via Banister TRIMP.
     Whoop's own algorithm is proprietary and unpublished. Resting HR defaults to the night's
@@ -438,8 +424,7 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
     as load; and "today" starts at wake time rather than midnight, matching how Whoop defines a
     day (sleep-to-sleep), since evening activity before falling asleep otherwise bleeds into the
     next day's score."""
-    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name,
-                                        deep_codes_str, light_codes_str, rem_codes_str, awake_codes_str)
+    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
     activity_df = get_cleaned_activity_df(activity_table, mtime, tz_name) if activity_table else pd.DataFrame()
     day_df = activity_df[activity_df['Date'] == target_date] if not activity_df.empty and 'Date' in activity_df.columns else pd.DataFrame()
 
@@ -551,8 +536,6 @@ if available_dates:
         for d in available_dates:
             day_info_by_date[d] = compute_strain_for_date(
                 d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                st.session_state.deep_codes, st.session_state.light_codes,
-                st.session_state.rem_codes, st.session_state.awake_codes,
                 st.session_state.max_hr_override, st.session_state.resting_hr_override, st.session_state.strain_sensitivity)
 
     st.sidebar.caption("🗓️ Date — Strain / HRV")
@@ -597,14 +580,6 @@ with st.sidebar.expander("⚙️ Advanced Settings"):
                      help="Turn down if Strain still runs high for how intense your days actually feel; turn up if it runs low.")
 
     st.divider()
-    st.caption("🌙 Sleep Stage Codes (optional)")
-    st.caption("Xiaomi's raw stage codes aren't publicly documented and vary by device/firmware. Check '⚙️ Database Transparency' below for a duration-per-code breakdown, compare against the Gadgetbridge app's own sleep report, and adjust these if they don't match.")
-    st.text_input("Deep sleep code(s)", key="deep_codes")
-    st.text_input("Light sleep code(s)", key="light_codes")
-    st.text_input("REM sleep code(s)", key="rem_codes")
-    st.text_input("Awake code(s), comma-separated (blank = none excluded)", key="awake_codes")
-
-    st.divider()
     st.caption(f"Active Activity Source: `{activity_table}`")
     if active_sleep_table:
         st.caption(f"Sleep Source: `{active_sleep_table}`")
@@ -615,13 +590,8 @@ resting_hr_override = st.session_state.resting_hr_override
 target_df = df_activity[df_activity['Date'] == selected_date] if not df_activity.empty and 'Date' in df_activity.columns else pd.DataFrame()
 last_7_days = df_activity[(df_activity['Date'] > (selected_date - timedelta(days=7))) & (df_activity['Date'] <= selected_date)] if not df_activity.empty and 'Date' in df_activity.columns else pd.DataFrame()
 
-sleep_info = compute_sleep_and_hrv(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                                    st.session_state.deep_codes, st.session_state.light_codes,
-                                    st.session_state.rem_codes, st.session_state.awake_codes)
+sleep_info = compute_sleep_and_hrv(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name)
 sleep_duration_mins = sleep_info["sleep_duration_mins"]
-deep_sleep_mins = sleep_info["deep_sleep_mins"]
-light_sleep_mins = sleep_info["light_sleep_mins"]
-rem_sleep_mins = sleep_info["rem_sleep_mins"]
 sleep_start_str = sleep_info["sleep_start_str"]
 sleep_end_str = sleep_info["sleep_end_str"]
 sleep_window_start = sleep_info["sleep_window_start"]
@@ -639,13 +609,11 @@ avg_hr = hr_data.mean() if not hr_data.empty else np.nan
 peak_hr = hr_data.max() if not hr_data.empty else np.nan
 
 strain_info = compute_strain_for_date(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                                       st.session_state.deep_codes, st.session_state.light_codes,
-                                       st.session_state.rem_codes, st.session_state.awake_codes,
                                        max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
 strain_score = strain_info["strain_score"]
 
 # Global Metric Hunter for SpO2 & Stress
-def fetch_global_metric(keywords):
+def fetch_global_metric(keywords, target_date):
     for t, cols in schema.items():
         val_col = next((c for c in cols if any(k in c for k in keywords)), None)
         if not val_col and any(k in t.upper() for k in keywords):
@@ -659,7 +627,7 @@ def fetch_global_metric(keywords):
                         temp.columns = [time_c, val_col]
                         max_v = temp[time_c].max()
                         dates = to_local(temp[time_c], unit='ms' if max_v > 2e10 else 's', tz=LOCAL_TZ).dt.date
-                        day_data = pd.to_numeric(temp[dates == selected_date][val_col], errors='coerce')
+                        day_data = pd.to_numeric(temp[dates == target_date][val_col], errors='coerce')
                         day_data = day_data.replace([0, 255], np.nan).dropna()
                         if not day_data.empty:
                             return day_data.mean()
@@ -667,8 +635,9 @@ def fetch_global_metric(keywords):
                     continue
     return np.nan
 
-spo2_val = fetch_global_metric(["SPO2", "OXYGEN"])
-stress_val = fetch_global_metric(["STRESS"])
+spo2_val = fetch_global_metric(["SPO2", "OXYGEN"], selected_date)
+stress_val = fetch_global_metric(["STRESS"], selected_date)
+prev_stress_val = fetch_global_metric(["STRESS"], selected_date - timedelta(days=1))
 
 def classify_stress(val):
     """Xiaomi/Huami's stress score follows the same 0-100 HRV-derived scale used across the
@@ -685,6 +654,152 @@ def classify_stress(val):
         return "🟠 Medium - elevated", "Higher than resting - could be exercise, caffeine, or genuine stress."
     else:
         return "🔴 High", "Significantly elevated - worth noting if it persists through the day."
+
+
+# --- Recovery Score (0-100) ---------------------------------------------------------------
+# Rough population reference points, not clinically validated percentiles - real population
+# RHR/HRV vary substantially by age, sex, and measurement method. Good enough for a relative
+# "roughly where does this sit" read, not a medical claim.
+POPULATION_RHR_REF = 50.0        # bpm - below this scores ~100 on the population axis
+POPULATION_HRV_LOW, POPULATION_HRV_HIGH = 20.0, 100.0  # ms - population "low" to "elite" range
+RECOVERY_WEIGHTS = {"Sleep Duration": 0.30, "Resting Heart Rate": 0.20, "HRV": 0.30,
+                     "Stress (previous day)": 0.10, "Strain (previous day)": 0.10}
+
+
+def _sleep_hours_subscore(hours):
+    """Peaks at 9h, falls off in both directions - matches Whoop's convention that both under-
+    and oversleeping cost points, rather than treating 'more sleep' as unconditionally better."""
+    if hours is None or pd.isna(hours) or hours <= 0:
+        return None
+    diff = abs(hours - 9.0)
+    return max(0.0, 100.0 - 5.0 * (diff ** 1.5))
+
+
+def _sleep_debt_cap(hours):
+    """A hard ceiling on the overall score for short sleep, applied on top of the weighted
+    blend rather than folded into it. Reasoning: at only 30% of the total weight, the sleep
+    subscore alone can be outvoted by a morning where RHR/HRV happen to read fine even after a
+    genuinely short night - real recovery doesn't work that way, so this puts a floor under how
+    good the score can look regardless of what the other components say. No cap above 7h."""
+    if hours is None or pd.isna(hours) or hours <= 0:
+        return 100.0
+    if hours >= 7.0:
+        return 100.0
+    deficit = 7.0 - hours
+    return max(30.0, 100.0 - deficit * 20.0)
+
+
+def _rhr_subscore(today_rhr, personal_avg_rhr):
+    """Blends a population-normed score with a personal-relative one (50 = exactly your own
+    average). This is the key difference from Whoop's purely self-relative approach: someone
+    with consistently excellent RHR who has a day merely 'average for them' still scores well
+    here, because the population half of the blend recognizes that's still good in absolute
+    terms - a pure self-relative score would flag it as a dip regardless of how good it is."""
+    if today_rhr is None or pd.isna(today_rhr):
+        return None
+    pop_score = max(0.0, min(100.0, 100.0 - (today_rhr - POPULATION_RHR_REF) * 2.0))
+    if personal_avg_rhr is not None and pd.notna(personal_avg_rhr):
+        personal_score = max(0.0, min(100.0, 50.0 + (personal_avg_rhr - today_rhr) * 5.0))
+        return 0.5 * pop_score + 0.5 * personal_score
+    return pop_score
+
+
+def _hrv_subscore(today_hrv, personal_avg_hrv):
+    """Same population/personal blend as RHR, using percentage deviation for the personal half
+    since baseline HRV varies hugely between individuals - a 10ms drop means very different
+    things to someone with a 30ms baseline versus a 100ms one."""
+    if today_hrv is None or pd.isna(today_hrv):
+        return None
+    pop_score = max(0.0, min(100.0, (today_hrv - POPULATION_HRV_LOW) * 100.0 / (POPULATION_HRV_HIGH - POPULATION_HRV_LOW)))
+    if personal_avg_hrv is not None and pd.notna(personal_avg_hrv) and personal_avg_hrv > 0:
+        pct_diff = (today_hrv - personal_avg_hrv) / personal_avg_hrv * 100.0
+        personal_score = max(0.0, min(100.0, 50.0 + pct_diff * 2.0))
+        return 0.5 * pop_score + 0.5 * personal_score
+    return pop_score
+
+
+def _stress_subscore(stress_val):
+    if stress_val is None or pd.isna(stress_val):
+        return None
+    return max(0.0, min(100.0, 100.0 - stress_val))
+
+
+def _strain_subscore(strain_val):
+    """A hard previous day costs some points but never dominates - it's a minor input here,
+    not the main signal, since HRV/RHR already partly reflect accumulated training stress."""
+    if strain_val is None or pd.isna(strain_val):
+        return None
+    return max(0.0, min(100.0, 100.0 - (strain_val / 21.0) * 40.0))
+
+
+@st.cache_data
+def compute_recovery_score(target_date, activity_table, active_sleep_table, mtime, tz_name,
+                            max_hr_override, resting_hr_override, sensitivity, available_dates_tuple, prev_stress):
+    """Recovery score (0-100): sleep duration (peak at 9h), resting HR and HRV (each blended
+    population-vs-personal, see subscore functions above), plus previous day's stress and
+    strain as smaller inputs. Any missing component is dropped entirely and the remaining
+    weights renormalize, rather than treating missing data as zero or failing."""
+    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
+    today_rhr = sleep_info["sleep_hr_median"]
+    today_hrv = sleep_info["hrv_val"]
+    sleep_hours = sleep_info["sleep_duration_mins"] / 60.0 if sleep_info["sleep_duration_mins"] > 0 else None
+
+    prior_dates = sorted([d for d in available_dates_tuple if d < target_date])[-30:]
+    prior_rhrs, prior_hrvs = [], []
+    for d in prior_dates:
+        pi = compute_sleep_and_hrv(d, activity_table, active_sleep_table, mtime, tz_name)
+        if pd.notna(pi["sleep_hr_median"]):
+            prior_rhrs.append(pi["sleep_hr_median"])
+        if pd.notna(pi["hrv_val"]):
+            prior_hrvs.append(pi["hrv_val"])
+    personal_avg_rhr = float(np.mean(prior_rhrs)) if prior_rhrs else None
+    personal_avg_hrv = float(np.mean(prior_hrvs)) if prior_hrvs else None
+
+    prev_date = target_date - timedelta(days=1)
+    prev_strain = None
+    if prev_date in available_dates_tuple:
+        prev_strain_info = compute_strain_for_date(prev_date, activity_table, active_sleep_table, mtime, tz_name,
+                                                     max_hr_override, resting_hr_override, sensitivity)
+        prev_strain = prev_strain_info["strain_score"]
+
+    components = {
+        "Sleep Duration": (_sleep_hours_subscore(sleep_hours), RECOVERY_WEIGHTS["Sleep Duration"]),
+        "Resting Heart Rate": (_rhr_subscore(today_rhr, personal_avg_rhr), RECOVERY_WEIGHTS["Resting Heart Rate"]),
+        "HRV": (_hrv_subscore(today_hrv, personal_avg_hrv), RECOVERY_WEIGHTS["HRV"]),
+        "Stress (previous day)": (_stress_subscore(prev_stress), RECOVERY_WEIGHTS["Stress (previous day)"]),
+        "Strain (previous day)": (_strain_subscore(prev_strain), RECOVERY_WEIGHTS["Strain (previous day)"]),
+    }
+    available = {k: (v, w) for k, (v, w) in components.items() if v is not None}
+    if not available:
+        return {"score": None, "components": {}, "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
+                "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
+                "raw_score_before_sleep_cap": None, "sleep_debt_cap": None}
+
+    total_weight = sum(w for _, w in available.values())
+    weighted_sum = sum(v * w for v, w in available.values())
+    raw_score = weighted_sum / total_weight
+    cap = _sleep_debt_cap(sleep_hours)
+    final_score = min(raw_score, cap)
+    return {"score": round(final_score), "components": {k: round(v, 1) for k, (v, _) in available.items()},
+            "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
+            "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
+            "raw_score_before_sleep_cap": round(raw_score), "sleep_debt_cap": round(cap) if cap < 100 else None}
+
+
+def classify_recovery(score):
+    if score is None:
+        return None, None
+    if score >= 67:
+        return "🟢 Well Recovered", "#2ecc71"
+    elif score >= 34:
+        return "🟡 Adequate Recovery", "#f1c40f"
+    else:
+        return "🔴 Low Recovery", "#e74c3c"
+
+
+recovery_info = compute_recovery_score(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                        max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
+                                        tuple(available_dates), prev_stress_val)
 
 # --- Dashboard UI Layout ---
 st.subheader(f"📊 Daily Report: {selected_date.strftime('%A, %B %d, %Y')}")
@@ -714,18 +829,11 @@ with col5:
         sd_value, sd_delta = "No Sleep Logged", None
     st.metric(label="💤 Sleep Duration", value=sd_value, delta=sd_delta, delta_color="off")
 with col6:
-    if deep_sleep_mins > 0 or light_sleep_mins > 0:
-        d_h, d_m = int(deep_sleep_mins // 60), int(deep_sleep_mins % 60)
-        l_h, l_m = int(light_sleep_mins // 60), int(light_sleep_mins % 60)
-        r_h, r_m = int(rem_sleep_mins // 60), int(rem_sleep_mins % 60)
-        stage_text = f"Deep: {d_h}h {d_m}m | Light: {l_h}h {l_m}m"
-        if rem_sleep_mins > 0:
-            stage_text += f" | REM: {r_h}h {r_m}m"
-        st.metric(label="🌊 Sleep Stages", value=stage_text)
-    elif sleep_diag.get("source") in ("activity_table_fallback_total_only", "activity_table_raw_kind_total_only"):
-        st.metric(label="🌊 Sleep Stages", value="Unavailable", delta="total-only source, see diagnostics", delta_color="off")
+    if recovery_info["score"] is not None:
+        label, _ = classify_recovery(recovery_info["score"])
+        st.metric(label="🔋 Recovery Score", value=f"{recovery_info['score']}/100", delta=label, delta_color="off")
     else:
-        st.metric(label="🌊 Deep Sleep / Cycles", value="N/A")
+        st.metric(label="🔋 Recovery Score", value="N/A", delta="not enough data yet", delta_color="off")
 with col7:
     st.metric(label="🩸 Blood Oxygen (SpO2)", value=f"{spo2_val:.1f}%" if pd.notna(spo2_val) else "No Sensor Data")
 with col8:
@@ -811,21 +919,21 @@ with st.expander("📈 Journal Insights: how your trends compare"):
         for d in journaled_dates:
             tags, _ = load_journal_entry(d)
             s_info = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                                              st.session_state.deep_codes, st.session_state.light_codes,
-                                              st.session_state.rem_codes, st.session_state.awake_codes,
                                               max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
             # Strain is wake-anchored and accumulates through day d, so it reflects day d itself.
-            # HRV/Sleep for "day d" on the dashboard are actually from the night ENDING that morning -
-            # i.e. they reflect what happened the evening before. What a tag logged for day d (say,
-            # alcohol that evening) actually affects is the night that FOLLOWS d, reported as day d+1's
-            # numbers. Pull those instead so the comparison lines up with the right night.
+            # HRV/Sleep/Recovery for "day d" on the dashboard are actually from the night ENDING
+            # that morning - i.e. they reflect what happened the evening before. What a tag logged
+            # for day d (say, alcohol that evening) actually affects is the night that FOLLOWS d,
+            # reported as day d+1's numbers. Pull those instead so the comparison lines up right.
             next_day_info = compute_strain_for_date(d + timedelta(days=1), activity_table, active_sleep_table, _db_mtime(),
-                                                      st.session_state.tz_name, st.session_state.deep_codes,
-                                                      st.session_state.light_codes, st.session_state.rem_codes,
-                                                      st.session_state.awake_codes, max_hr_override, resting_hr_override,
+                                                      st.session_state.tz_name, max_hr_override, resting_hr_override,
                                                       st.session_state.strain_sensitivity)
+            stress_on_d = fetch_global_metric(["STRESS"], d)
+            next_day_recovery = compute_recovery_score(d + timedelta(days=1), activity_table, active_sleep_table, _db_mtime(),
+                                                         st.session_state.tz_name, max_hr_override, resting_hr_override,
+                                                         st.session_state.strain_sensitivity, tuple(available_dates), stress_on_d)
             rows.append({"tags": tags, "strain": s_info["strain_score"], "hrv": next_day_info["hrv_val"],
-                         "sleep_mins": next_day_info["sleep_duration_mins"]})
+                         "sleep_mins": next_day_info["sleep_duration_mins"], "recovery": next_day_recovery["score"]})
 
         all_tags = sorted({t for r in rows for t in r["tags"].keys()})
 
@@ -864,6 +972,7 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             comparison_rows.append({
                 "Tag": tag, "n (Yes/No)": f"{len(yes_rows)}/{len(no_rows)}",
                 "Strain that day (Yes)": _avg("strain", yes_rows), "Strain that day (No)": _avg("strain", no_rows),
+                "Recovery next morning (Yes)": _avg("recovery", yes_rows), "Recovery next morning (No)": _avg("recovery", no_rows),
                 "HRV that night (Yes)": _avg("hrv", yes_rows), "HRV that night (No)": _avg("hrv", no_rows),
                 "Sleep that night (Yes)": _avg("sleep_mins", yes_rows), "Sleep that night (No)": _avg("sleep_mins", no_rows),
                 "Correlated With": correlated or "—",
@@ -879,11 +988,13 @@ with st.expander("📈 Journal Insights: how your trends compare"):
                 comp_df[col] = comp_df[col].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
             for col in ["HRV that night (Yes)", "HRV that night (No)"]:
                 comp_df[col] = comp_df[col].apply(lambda v: f"{int(v)} ms" if pd.notna(v) else "—")
+            for col in ["Recovery next morning (Yes)", "Recovery next morning (No)"]:
+                comp_df[col] = comp_df[col].apply(lambda v: f"{int(v)}/100" if pd.notna(v) else "—")
             st.dataframe(comp_df, hide_index=True, width='stretch')
-            st.caption("Strain reflects the day itself (from when you woke up). HRV and Sleep reflect the night that "
-                       "*followed* that day, since that's the sleep your logged behavior would actually have affected - "
-                       "e.g. Alcohol logged for the 5th is compared against your HRV on the night of the 5th→6th, not the "
-                       "night before it.")
+            st.caption("Strain reflects the day itself (from when you woke up). Recovery, HRV, and Sleep reflect the night "
+                       "that *followed* that day, since that's the sleep your logged behavior would actually have affected - "
+                       "e.g. Alcohol logged for the 5th is compared against your Recovery Score on the morning of the 6th, "
+                       "not the morning of the 5th.")
             st.caption("\"Correlated With\" flags tags that tend to happen together in your logs (+ means together, − means opposite), "
                        "so a strong number there might really belong to the correlated tag, not this one. See below to help tell them apart.")
 
@@ -906,10 +1017,13 @@ with st.expander("📈 Journal Insights: how your trends compare"):
                     any_controlled = True
                     s_yes, s_no = _avg("strain", yes_s), _avg("strain", no_s)
                     h_yes, h_no = _avg("hrv", yes_s), _avg("hrv", no_s)
+                    r_yes, r_no = _avg("recovery", yes_s), _avg("recovery", no_s)
                     line = f"**{tag}** vs no {tag}, on days without **{other}** (n={len(yes_s)}/{len(no_s)}): "
                     parts = []
                     if pd.notna(s_yes) and pd.notna(s_no):
                         parts.append(f"Strain {s_yes:.1f} vs {s_no:.1f}")
+                    if pd.notna(r_yes) and pd.notna(r_no):
+                        parts.append(f"Recovery {int(r_yes)} vs {int(r_no)}")
                     if pd.notna(h_yes) and pd.notna(h_no):
                         parts.append(f"HRV {int(h_yes)}ms vs {int(h_no)}ms")
                     st.markdown(line + ", ".join(parts) if parts else line + "not enough data")
@@ -941,6 +1055,27 @@ with st.expander("⚙️ Database Transparency & Sleep Table Inspector"):
     if active_sleep_table:
         st.write("Sleep Table Preview:")
         st.dataframe(load_table(active_sleep_table, _db_mtime()).head(50))
+
+    st.markdown("**Recovery Score breakdown**")
+    if recovery_info["score"] is not None:
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Today's resting HR", f"{recovery_info['today_rhr']:.0f} bpm" if pd.notna(recovery_info['today_rhr']) else "—")
+        rc2.metric("Your average RHR", f"{recovery_info['personal_avg_rhr']:.0f} bpm" if recovery_info['personal_avg_rhr'] else "no history yet")
+        rc3.metric("Sleep", f"{recovery_info['sleep_hours']:.1f}h" if recovery_info['sleep_hours'] else "—")
+        rc4, rc5, _ = st.columns(3)
+        rc4.metric("Today's HRV", f"{recovery_info['today_hrv']:.0f} ms" if pd.notna(recovery_info['today_hrv']) else "—")
+        rc5.metric("Your average HRV", f"{recovery_info['personal_avg_hrv']:.0f} ms" if recovery_info['personal_avg_hrv'] else "no history yet")
+        st.write("Component subscores (each 0-100, weighted and averaged into the final score):")
+        st.json(recovery_info["components"], expanded=True)
+        st.caption("RHR and HRV subscores each blend a population-normed estimate with how today compares to your own "
+                   "rolling average (up to the last 30 days before this one) - so a day that's merely average for you, "
+                   "but still strong by general standards, doesn't get penalized the way a purely self-relative score would.")
+        if recovery_info["sleep_debt_cap"] is not None:
+            st.caption(f"⚠️ Sleep-debt cap applied: the weighted blend of components alone would have scored "
+                       f"{recovery_info['raw_score_before_sleep_cap']}, but under 7h of sleep puts a ceiling of "
+                       f"{recovery_info['sleep_debt_cap']} on the overall score regardless of how RHR/HRV read that morning.")
+    else:
+        st.caption("Not enough data yet to compute a Recovery Score for this day.")
 
     st.markdown("**Activity/Steps diagnostics for the selected day**")
     if not target_df.empty:
