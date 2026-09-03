@@ -384,20 +384,9 @@ def compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime
                             sleep_diag["source"] = "activity_table_fallback_total_only"
                             sleep_diag["note"] = "Total-only estimate from the activity table's SLEEP flag - treat as approximate."
 
-    # Resting-proxy HRV fallback: only used when no real sleep window was found at all, and only
-    # trusted with a reasonably large sample - a sparse partial day (e.g. the band was only just
-    # paired that afternoon) was producing a confident-looking HRV number from a handful of
-    # arbitrary low readings that weren't remotely representative of actual rest.
-    RESTING_PROXY_MIN_SAMPLES = 30
-    if sleep_hr_data.empty and not activity_df.empty and 'Date' in activity_df.columns:
-        day_df = activity_df[activity_df['Date'] == target_date]
-        hr_clean = day_df['HEART_RATE'].dropna() if 'HEART_RATE' in day_df.columns else pd.Series(dtype=float)
-        if len(hr_clean) >= RESTING_PROXY_MIN_SAMPLES:
-            candidate = hr_clean[hr_clean <= hr_clean.quantile(0.25)]
-            if len(candidate) >= 6:
-                sleep_hr_data = candidate
-                result["hrv_source"] = "resting_proxy"
-
+    # HRV (and RHR, and therefore Recovery Score) are only ever computed from a real detected
+    # sleep window. No daytime resting-proxy fallback: a day with no sleep detected should show
+    # "N/A", not a number quietly estimated from arbitrary low daytime readings.
     if not sleep_hr_data.empty:
         result["sleep_hr_median"] = float(sleep_hr_data.median())
 
@@ -456,6 +445,178 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
 
     return {"strain_score": strain, "total_steps": total_steps, "avg_hr": avg_hr,
             "hrv_val": sleep_info["hrv_val"], "sleep_duration_mins": sleep_info["sleep_duration_mins"]}
+
+
+# Global Metric Hunter for SpO2 & Stress
+def fetch_global_metric(keywords, target_date):
+    for t, cols in schema.items():
+        val_col = next((c for c in cols if any(k in c for k in keywords)), None)
+        if not val_col and any(k in t.upper() for k in keywords):
+            val_col = next((c for c in cols if c in ["LEVEL", "VALUE", "SPO2", "STRESS", "INTENSITY"]), None)
+        if val_col:
+            time_c = next((c for c in cols if c in ["TIMESTAMP", "TIME", "DATE", "RAW_TIMESTAMP", "START_TIME"]), None)
+            if time_c:
+                try:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        temp = pd.read_sql_query(f'SELECT "{time_c}", "{val_col}" FROM "{t}"', conn)
+                        temp.columns = [time_c, val_col]
+                        max_v = temp[time_c].max()
+                        dates = to_local(temp[time_c], unit='ms' if max_v > 2e10 else 's', tz=LOCAL_TZ).dt.date
+                        day_data = pd.to_numeric(temp[dates == target_date][val_col], errors='coerce')
+                        day_data = day_data.replace([0, 255], np.nan).dropna()
+                        if not day_data.empty:
+                            return day_data.mean()
+                except Exception:
+                    continue
+    return np.nan
+
+
+# --- Recovery Score (0-100) ---------------------------------------------------------------
+# Rough population reference points, not clinically validated percentiles - real population
+# RHR/HRV vary substantially by age, sex, and measurement method. Good enough for a relative
+# "roughly where does this sit" read, not a medical claim.
+POPULATION_RHR_REF = 50.0        # bpm - below this scores ~100 on the population axis
+POPULATION_HRV_LOW, POPULATION_HRV_HIGH = 20.0, 100.0  # ms - population "low" to "elite" range
+RECOVERY_WEIGHTS = {"Sleep Duration": 0.40, "Resting Heart Rate": 0.20, "HRV": 0.20,
+                     "Stress (previous day)": 0.10, "Strain (previous day)": 0.10}
+
+
+def _sleep_hours_subscore(hours):
+    """Peaks at 9h, falls off in both directions - matches Whoop's convention that both under-
+    and oversleeping cost points, rather than treating 'more sleep' as unconditionally better.
+    Sleep carries the largest single weight (40%) of any component here."""
+    if hours is None or pd.isna(hours) or hours <= 0:
+        return None
+    diff = abs(hours - 9.0)
+    return max(0.0, 100.0 - 5.0 * (diff ** 1.5))
+
+
+def _sleep_debt_cap(hours):
+    """A hard ceiling only for genuinely severe sleep deprivation - under 4 hours caps the
+    overall score at 65 regardless of how RHR/HRV happen to read that morning. Sleep's 40%
+    weight in the blend already does most of the work for moderate shortfalls; this only
+    steps in for the extreme end."""
+    if hours is None or pd.isna(hours) or hours <= 0:
+        return 100.0
+    if hours < 4.0:
+        return 65.0
+    return 100.0
+
+
+def _rhr_subscore(today_rhr, personal_avg_rhr):
+    """Blends a population-normed score with a personal-relative one (50 = exactly your own
+    average). This is the key difference from Whoop's purely self-relative approach: someone
+    with consistently excellent RHR who has a day merely 'average for them' still scores well
+    here, because the population half of the blend recognizes that's still good in absolute
+    terms - a pure self-relative score would flag it as a dip regardless of how good it is."""
+    if today_rhr is None or pd.isna(today_rhr):
+        return None
+    pop_score = max(0.0, min(100.0, 100.0 - (today_rhr - POPULATION_RHR_REF) * 2.0))
+    if personal_avg_rhr is not None and pd.notna(personal_avg_rhr):
+        personal_score = max(0.0, min(100.0, 50.0 + (personal_avg_rhr - today_rhr) * 5.0))
+        return 0.5 * pop_score + 0.5 * personal_score
+    return pop_score
+
+
+def _hrv_subscore(today_hrv, personal_avg_hrv):
+    """Same population/personal blend as RHR, using percentage deviation for the personal half
+    since baseline HRV varies hugely between individuals - a 10ms drop means very different
+    things to someone with a 30ms baseline versus a 100ms one."""
+    if today_hrv is None or pd.isna(today_hrv):
+        return None
+    pop_score = max(0.0, min(100.0, (today_hrv - POPULATION_HRV_LOW) * 100.0 / (POPULATION_HRV_HIGH - POPULATION_HRV_LOW)))
+    if personal_avg_hrv is not None and pd.notna(personal_avg_hrv) and personal_avg_hrv > 0:
+        pct_diff = (today_hrv - personal_avg_hrv) / personal_avg_hrv * 100.0
+        personal_score = max(0.0, min(100.0, 50.0 + pct_diff * 2.0))
+        return 0.5 * pop_score + 0.5 * personal_score
+    return pop_score
+
+
+def _stress_subscore(stress_val):
+    if stress_val is None or pd.isna(stress_val):
+        return None
+    return max(0.0, min(100.0, 100.0 - stress_val))
+
+
+def _strain_subscore(strain_val):
+    """A hard previous day costs some points but never dominates - it's a minor input here,
+    not the main signal, since HRV/RHR already partly reflect accumulated training stress."""
+    if strain_val is None or pd.isna(strain_val):
+        return None
+    return max(0.0, min(100.0, 100.0 - (strain_val / 21.0) * 40.0))
+
+
+@st.cache_data
+def compute_recovery_score(target_date, activity_table, active_sleep_table, mtime, tz_name,
+                            max_hr_override, resting_hr_override, sensitivity, available_dates_tuple, prev_stress):
+    """Recovery score (0-100): sleep duration (peak at 9h, 40% weight), resting HR and HRV
+    (each blended population-vs-personal, see subscore functions above), plus previous day's
+    stress and strain as smaller inputs. Any missing component is dropped entirely and the
+    remaining weights renormalize, rather than treating missing data as zero or failing."""
+    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
+    today_rhr = sleep_info["sleep_hr_median"]
+    today_hrv = sleep_info["hrv_val"]
+    sleep_hours = sleep_info["sleep_duration_mins"] / 60.0 if sleep_info["sleep_duration_mins"] > 0 else None
+
+    if sleep_hours is None:
+        # No real sleep detected for this night - RHR/HRV are already unavailable without it (no
+        # daytime resting-proxy fallback), but Stress+Strain alone could still renormalize into a
+        # confident-looking score from very thin evidence. Require sleep explicitly instead.
+        return {"score": None, "components": {}, "personal_avg_rhr": None, "personal_avg_hrv": None,
+                "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": None,
+                "raw_score_before_sleep_cap": None, "sleep_debt_cap": None}
+
+    prior_dates = sorted([d for d in available_dates_tuple if d < target_date])[-30:]
+    prior_rhrs, prior_hrvs = [], []
+    for d in prior_dates:
+        pi = compute_sleep_and_hrv(d, activity_table, active_sleep_table, mtime, tz_name)
+        if pd.notna(pi["sleep_hr_median"]):
+            prior_rhrs.append(pi["sleep_hr_median"])
+        if pd.notna(pi["hrv_val"]):
+            prior_hrvs.append(pi["hrv_val"])
+    personal_avg_rhr = float(np.mean(prior_rhrs)) if prior_rhrs else None
+    personal_avg_hrv = float(np.mean(prior_hrvs)) if prior_hrvs else None
+
+    prev_date = target_date - timedelta(days=1)
+    prev_strain = None
+    if prev_date in available_dates_tuple:
+        prev_strain_info = compute_strain_for_date(prev_date, activity_table, active_sleep_table, mtime, tz_name,
+                                                     max_hr_override, resting_hr_override, sensitivity)
+        prev_strain = prev_strain_info["strain_score"]
+
+    components = {
+        "Sleep Duration": (_sleep_hours_subscore(sleep_hours), RECOVERY_WEIGHTS["Sleep Duration"]),
+        "Resting Heart Rate": (_rhr_subscore(today_rhr, personal_avg_rhr), RECOVERY_WEIGHTS["Resting Heart Rate"]),
+        "HRV": (_hrv_subscore(today_hrv, personal_avg_hrv), RECOVERY_WEIGHTS["HRV"]),
+        "Stress (previous day)": (_stress_subscore(prev_stress), RECOVERY_WEIGHTS["Stress (previous day)"]),
+        "Strain (previous day)": (_strain_subscore(prev_strain), RECOVERY_WEIGHTS["Strain (previous day)"]),
+    }
+    available = {k: (v, w) for k, (v, w) in components.items() if v is not None}
+    if not available:
+        return {"score": None, "components": {}, "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
+                "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
+                "raw_score_before_sleep_cap": None, "sleep_debt_cap": None}
+
+    total_weight = sum(w for _, w in available.values())
+    weighted_sum = sum(v * w for v, w in available.values())
+    raw_score = weighted_sum / total_weight
+    cap = _sleep_debt_cap(sleep_hours)
+    final_score = min(raw_score, cap)
+    return {"score": round(final_score), "components": {k: round(v, 1) for k, (v, _) in available.items()},
+            "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
+            "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
+            "raw_score_before_sleep_cap": round(raw_score), "sleep_debt_cap": round(cap) if cap < 100 else None}
+
+
+def classify_recovery(score):
+    if score is None:
+        return None, None
+    if score >= 67:
+        return "🟢 Well Recovered", "#2ecc71"
+    elif score >= 34:
+        return "🟡 Adequate Recovery", "#f1c40f"
+    else:
+        return "🔴 Low Recovery", "#e74c3c"
 
 
 # --- Daily Journal: simple per-day txt logs + trend comparisons ----------------------------
@@ -612,29 +773,6 @@ strain_info = compute_strain_for_date(selected_date, activity_table, active_slee
                                        max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
 strain_score = strain_info["strain_score"]
 
-# Global Metric Hunter for SpO2 & Stress
-def fetch_global_metric(keywords, target_date):
-    for t, cols in schema.items():
-        val_col = next((c for c in cols if any(k in c for k in keywords)), None)
-        if not val_col and any(k in t.upper() for k in keywords):
-            val_col = next((c for c in cols if c in ["LEVEL", "VALUE", "SPO2", "STRESS", "INTENSITY"]), None)
-        if val_col:
-            time_c = next((c for c in cols if c in ["TIMESTAMP", "TIME", "DATE", "RAW_TIMESTAMP", "START_TIME"]), None)
-            if time_c:
-                try:
-                    with sqlite3.connect(DB_FILE) as conn:
-                        temp = pd.read_sql_query(f'SELECT "{time_c}", "{val_col}" FROM "{t}"', conn)
-                        temp.columns = [time_c, val_col]
-                        max_v = temp[time_c].max()
-                        dates = to_local(temp[time_c], unit='ms' if max_v > 2e10 else 's', tz=LOCAL_TZ).dt.date
-                        day_data = pd.to_numeric(temp[dates == target_date][val_col], errors='coerce')
-                        day_data = day_data.replace([0, 255], np.nan).dropna()
-                        if not day_data.empty:
-                            return day_data.mean()
-                except Exception:
-                    continue
-    return np.nan
-
 spo2_val = fetch_global_metric(["SPO2", "OXYGEN"], selected_date)
 stress_val = fetch_global_metric(["STRESS"], selected_date)
 prev_stress_val = fetch_global_metric(["STRESS"], selected_date - timedelta(days=1))
@@ -655,148 +793,6 @@ def classify_stress(val):
     else:
         return "🔴 High", "Significantly elevated - worth noting if it persists through the day."
 
-
-# --- Recovery Score (0-100) ---------------------------------------------------------------
-# Rough population reference points, not clinically validated percentiles - real population
-# RHR/HRV vary substantially by age, sex, and measurement method. Good enough for a relative
-# "roughly where does this sit" read, not a medical claim.
-POPULATION_RHR_REF = 50.0        # bpm - below this scores ~100 on the population axis
-POPULATION_HRV_LOW, POPULATION_HRV_HIGH = 20.0, 100.0  # ms - population "low" to "elite" range
-RECOVERY_WEIGHTS = {"Sleep Duration": 0.30, "Resting Heart Rate": 0.20, "HRV": 0.30,
-                     "Stress (previous day)": 0.10, "Strain (previous day)": 0.10}
-
-
-def _sleep_hours_subscore(hours):
-    """Peaks at 9h, falls off in both directions - matches Whoop's convention that both under-
-    and oversleeping cost points, rather than treating 'more sleep' as unconditionally better."""
-    if hours is None or pd.isna(hours) or hours <= 0:
-        return None
-    diff = abs(hours - 9.0)
-    return max(0.0, 100.0 - 5.0 * (diff ** 1.5))
-
-
-def _sleep_debt_cap(hours):
-    """A hard ceiling on the overall score for short sleep, applied on top of the weighted
-    blend rather than folded into it. Reasoning: at only 30% of the total weight, the sleep
-    subscore alone can be outvoted by a morning where RHR/HRV happen to read fine even after a
-    genuinely short night - real recovery doesn't work that way, so this puts a floor under how
-    good the score can look regardless of what the other components say. No cap above 7h."""
-    if hours is None or pd.isna(hours) or hours <= 0:
-        return 100.0
-    if hours >= 7.0:
-        return 100.0
-    deficit = 7.0 - hours
-    return max(30.0, 100.0 - deficit * 20.0)
-
-
-def _rhr_subscore(today_rhr, personal_avg_rhr):
-    """Blends a population-normed score with a personal-relative one (50 = exactly your own
-    average). This is the key difference from Whoop's purely self-relative approach: someone
-    with consistently excellent RHR who has a day merely 'average for them' still scores well
-    here, because the population half of the blend recognizes that's still good in absolute
-    terms - a pure self-relative score would flag it as a dip regardless of how good it is."""
-    if today_rhr is None or pd.isna(today_rhr):
-        return None
-    pop_score = max(0.0, min(100.0, 100.0 - (today_rhr - POPULATION_RHR_REF) * 2.0))
-    if personal_avg_rhr is not None and pd.notna(personal_avg_rhr):
-        personal_score = max(0.0, min(100.0, 50.0 + (personal_avg_rhr - today_rhr) * 5.0))
-        return 0.5 * pop_score + 0.5 * personal_score
-    return pop_score
-
-
-def _hrv_subscore(today_hrv, personal_avg_hrv):
-    """Same population/personal blend as RHR, using percentage deviation for the personal half
-    since baseline HRV varies hugely between individuals - a 10ms drop means very different
-    things to someone with a 30ms baseline versus a 100ms one."""
-    if today_hrv is None or pd.isna(today_hrv):
-        return None
-    pop_score = max(0.0, min(100.0, (today_hrv - POPULATION_HRV_LOW) * 100.0 / (POPULATION_HRV_HIGH - POPULATION_HRV_LOW)))
-    if personal_avg_hrv is not None and pd.notna(personal_avg_hrv) and personal_avg_hrv > 0:
-        pct_diff = (today_hrv - personal_avg_hrv) / personal_avg_hrv * 100.0
-        personal_score = max(0.0, min(100.0, 50.0 + pct_diff * 2.0))
-        return 0.5 * pop_score + 0.5 * personal_score
-    return pop_score
-
-
-def _stress_subscore(stress_val):
-    if stress_val is None or pd.isna(stress_val):
-        return None
-    return max(0.0, min(100.0, 100.0 - stress_val))
-
-
-def _strain_subscore(strain_val):
-    """A hard previous day costs some points but never dominates - it's a minor input here,
-    not the main signal, since HRV/RHR already partly reflect accumulated training stress."""
-    if strain_val is None or pd.isna(strain_val):
-        return None
-    return max(0.0, min(100.0, 100.0 - (strain_val / 21.0) * 40.0))
-
-
-@st.cache_data
-def compute_recovery_score(target_date, activity_table, active_sleep_table, mtime, tz_name,
-                            max_hr_override, resting_hr_override, sensitivity, available_dates_tuple, prev_stress):
-    """Recovery score (0-100): sleep duration (peak at 9h), resting HR and HRV (each blended
-    population-vs-personal, see subscore functions above), plus previous day's stress and
-    strain as smaller inputs. Any missing component is dropped entirely and the remaining
-    weights renormalize, rather than treating missing data as zero or failing."""
-    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
-    today_rhr = sleep_info["sleep_hr_median"]
-    today_hrv = sleep_info["hrv_val"]
-    sleep_hours = sleep_info["sleep_duration_mins"] / 60.0 if sleep_info["sleep_duration_mins"] > 0 else None
-
-    prior_dates = sorted([d for d in available_dates_tuple if d < target_date])[-30:]
-    prior_rhrs, prior_hrvs = [], []
-    for d in prior_dates:
-        pi = compute_sleep_and_hrv(d, activity_table, active_sleep_table, mtime, tz_name)
-        if pd.notna(pi["sleep_hr_median"]):
-            prior_rhrs.append(pi["sleep_hr_median"])
-        if pd.notna(pi["hrv_val"]):
-            prior_hrvs.append(pi["hrv_val"])
-    personal_avg_rhr = float(np.mean(prior_rhrs)) if prior_rhrs else None
-    personal_avg_hrv = float(np.mean(prior_hrvs)) if prior_hrvs else None
-
-    prev_date = target_date - timedelta(days=1)
-    prev_strain = None
-    if prev_date in available_dates_tuple:
-        prev_strain_info = compute_strain_for_date(prev_date, activity_table, active_sleep_table, mtime, tz_name,
-                                                     max_hr_override, resting_hr_override, sensitivity)
-        prev_strain = prev_strain_info["strain_score"]
-
-    components = {
-        "Sleep Duration": (_sleep_hours_subscore(sleep_hours), RECOVERY_WEIGHTS["Sleep Duration"]),
-        "Resting Heart Rate": (_rhr_subscore(today_rhr, personal_avg_rhr), RECOVERY_WEIGHTS["Resting Heart Rate"]),
-        "HRV": (_hrv_subscore(today_hrv, personal_avg_hrv), RECOVERY_WEIGHTS["HRV"]),
-        "Stress (previous day)": (_stress_subscore(prev_stress), RECOVERY_WEIGHTS["Stress (previous day)"]),
-        "Strain (previous day)": (_strain_subscore(prev_strain), RECOVERY_WEIGHTS["Strain (previous day)"]),
-    }
-    available = {k: (v, w) for k, (v, w) in components.items() if v is not None}
-    if not available:
-        return {"score": None, "components": {}, "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
-                "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
-                "raw_score_before_sleep_cap": None, "sleep_debt_cap": None}
-
-    total_weight = sum(w for _, w in available.values())
-    weighted_sum = sum(v * w for v, w in available.values())
-    raw_score = weighted_sum / total_weight
-    cap = _sleep_debt_cap(sleep_hours)
-    final_score = min(raw_score, cap)
-    return {"score": round(final_score), "components": {k: round(v, 1) for k, (v, _) in available.items()},
-            "personal_avg_rhr": personal_avg_rhr, "personal_avg_hrv": personal_avg_hrv,
-            "today_rhr": today_rhr, "today_hrv": today_hrv, "sleep_hours": sleep_hours,
-            "raw_score_before_sleep_cap": round(raw_score), "sleep_debt_cap": round(cap) if cap < 100 else None}
-
-
-def classify_recovery(score):
-    if score is None:
-        return None, None
-    if score >= 67:
-        return "🟢 Well Recovered", "#2ecc71"
-    elif score >= 34:
-        return "🟡 Adequate Recovery", "#f1c40f"
-    else:
-        return "🔴 Low Recovery", "#e74c3c"
-
-
 recovery_info = compute_recovery_score(selected_date, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                         max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
                                         tuple(available_dates), prev_stress_val)
@@ -808,7 +804,7 @@ col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric(label="🔥 Day Strain (0-21)", value=f"{strain_score:.1f}")
 with col2:
-    hrv_caption = {"sleep": "from overnight HR", "resting_proxy": "resting-proxy, not real sleep HRV", "none": ""}[hrv_source]
+    hrv_caption = "from overnight HR" if hrv_source == "sleep" else ""
     st.metric(label="⚡ HRV (RMSSD)", value=f"{int(hrv_val)} ms" if pd.notna(hrv_val) else "N/A", delta=hrv_caption if hrv_caption else None, delta_color="off")
 with col3:
     st.metric(label="❤️ Avg Heart Rate", value=f"{avg_hr:.1f} bpm" if pd.notna(avg_hr) else "N/A")
