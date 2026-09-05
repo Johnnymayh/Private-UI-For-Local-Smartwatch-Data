@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 # Page Configuration
 st.set_page_config(
-    page_title="Whoop-Style Health Dashboard",
+    page_title="Smartwatch Dashboard",
     page_icon="⚡",
     layout="wide",
 )
