@@ -412,7 +412,13 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
     actual overnight HR; minutes are smoothed and gated so ordinary daytime drift doesn't count
     as load; and "today" starts at wake time rather than midnight, matching how Whoop defines a
     day (sleep-to-sleep), since evening activity before falling asleep otherwise bleeds into the
-    next day's score."""
+    next day's score.
+
+    The raw TRIMP total is mapped onto the 0-21 scale with a saturating exponential
+    (21*(1-e^-trimp/T)) rather than a log curve: this stays close to proportional through
+    low-to-moderate effort, so a light day and a heavy day are actually distinguishable, and
+    only compresses hard as it nears the ceiling - reaching 20+ still takes a genuinely
+    exceptional day, not just "somewhat more than a 10.\""""
     sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
     activity_df = get_cleaned_activity_df(activity_table, mtime, tz_name) if activity_table else pd.DataFrame()
     day_df = activity_df[activity_df['Date'] == target_date] if not activity_df.empty and 'Date' in activity_df.columns else pd.DataFrame()
@@ -438,7 +444,9 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
         active = smoothed[smoothed >= (resting_hr + STRAIN_ACTIVITY_GATE)]
         frac = ((active - resting_hr) / hr_reserve).clip(lower=0, upper=1)
         trimp = (frac * 0.64 * np.exp(1.92 * frac)).sum()
-        strain = min(21.0, round(sensitivity * 1.9 * np.log1p(trimp / 0.5), 1))
+        STRAIN_SATURATION_T = 240.0  # lower = curve saturates faster (higher scores for the same trimp)
+        effective_t = STRAIN_SATURATION_T / max(0.01, sensitivity)
+        strain = min(21.0, round(21.0 * (1.0 - np.exp(-trimp / effective_t)), 1))
 
     total_steps = day_df['STEPS'].sum() if not day_df.empty and 'STEPS' in day_df.columns else 0
     avg_hr = day_df['HEART_RATE'].mean() if not day_df.empty and 'HEART_RATE' in day_df.columns else np.nan
@@ -691,25 +699,57 @@ if not df_activity.empty and 'Date' in df_activity.columns:
 else:
     available_dates = []
 
-if available_dates:
-    day_info_by_date = {}
-    with st.spinner("Loading history..."):
-        for d in available_dates:
-            day_info_by_date[d] = compute_strain_for_date(
-                d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-                st.session_state.max_hr_override, st.session_state.resting_hr_override, st.session_state.strain_sensitivity)
+if "week_offset" not in st.session_state:
+    st.session_state.week_offset = 0
 
-    st.sidebar.caption("🗓️ Date — Strain / HRV")
+if available_dates:
+    most_recent = available_dates[0]
+    earliest = available_dates[-1]
+
+    week_end = most_recent - timedelta(days=7 * st.session_state.week_offset)
+    week_dates = [week_end - timedelta(days=i) for i in range(7)]
+
+    can_go_back = week_dates[-1] > earliest
+    can_go_forward = st.session_state.week_offset > 0
+
+    nav_prev, nav_label, nav_next = st.sidebar.columns([1, 3, 1])
+    with nav_prev:
+        if st.button("◀", key="week_prev", disabled=not can_go_back):
+            st.session_state.week_offset += 1
+            st.rerun()
+    with nav_label:
+        st.markdown(f"<p style='text-align:center;margin:0;padding-top:5px;font-size:0.8em;color:#888;'>"
+                   f"{week_dates[-1].strftime('%b %d')}–{week_dates[0].strftime('%b %d')}</p>", unsafe_allow_html=True)
+    with nav_next:
+        if st.button("▶", key="week_next", disabled=not can_go_forward):
+            st.session_state.week_offset -= 1
+            st.rerun()
+
+    day_info_by_date = {}
+    with st.spinner("Loading week..."):
+        for d in week_dates:
+            strain_info_d = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                                      st.session_state.max_hr_override, st.session_state.resting_hr_override,
+                                                      st.session_state.strain_sensitivity)
+            stress_prev_d = fetch_global_metric(["STRESS"], d - timedelta(days=1))
+            recovery_d = compute_recovery_score(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                                 st.session_state.max_hr_override, st.session_state.resting_hr_override,
+                                                 st.session_state.strain_sensitivity, tuple(available_dates), stress_prev_d)
+            day_info_by_date[d] = {"strain_score": strain_info_d["strain_score"], "hrv_val": strain_info_d["hrv_val"],
+                                    "recovery_score": recovery_d["score"]}
+
+    st.sidebar.caption("🗓️ Date — Recovery / Strain / HRV")
 
     def _fmt_date(d):
         info = day_info_by_date.get(d, {})
-        strain, hrv = info.get("strain_score"), info.get("hrv_val")
+        strain, hrv, recovery = info.get("strain_score"), info.get("hrv_val"), info.get("recovery_score")
         strain_str = f"{strain:.1f}" if pd.notna(strain) else "—"
         hrv_str = f"{int(hrv)}ms" if pd.notna(hrv) else "—"
-        return f"{d.strftime('%a %d %b')}  —  🔥{strain_str}  ⚡{hrv_str}"
+        recovery_str = str(int(recovery)) if recovery is not None else "—"
+        return f"{d.strftime('%a %d %b')}  —  🔋{recovery_str} 🔥{strain_str} ⚡{hrv_str}"
 
-    selected_date = st.sidebar.radio("Select a day to analyze", available_dates, format_func=_fmt_date,
-                                      label_visibility="collapsed")
+    selected_date = st.sidebar.radio("Select a day to analyze", week_dates, format_func=_fmt_date,
+                                      label_visibility="collapsed", key=f"date_radio_{st.session_state.week_offset}")
 else:
     selected_date = datetime.now().date()
 
@@ -852,6 +892,23 @@ if not last_7_days.empty and "STEPS" in last_7_days.columns and last_7_days['STE
     st.altair_chart(step_chart, width='stretch')
 else:
     st.info("No step data available.")
+
+st.subheader("💤 7-Day Sleep Trend")
+sleep_week_dates = sorted(selected_date - timedelta(days=i) for i in range(7))
+sleep_week_rows = []
+for d in sleep_week_dates:
+    si = compute_sleep_and_hrv(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name)
+    sleep_week_rows.append({"Day": d.strftime('%a %d'), "MINUTES": si["sleep_duration_mins"]})
+sleep_week_df = pd.DataFrame(sleep_week_rows)
+if sleep_week_df['MINUTES'].sum() > 0:
+    sleep_chart = alt.Chart(sleep_week_df).mark_bar(color="#9b59b6").encode(
+        x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('MINUTES:Q', title='Minutes'),
+        tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip('MINUTES:Q', title='Minutes')],
+    ).properties(height=280)
+    st.altair_chart(sleep_chart, width='stretch')
+else:
+    st.info("No sleep data available.")
 
 st.divider()
 
