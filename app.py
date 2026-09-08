@@ -656,32 +656,46 @@ def _journal_path(d):
 
 def load_journal_entry(d):
     path = _journal_path(d)
-    tags, notes = {}, ""
+    tags, notes, workouts = {}, "", {}
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             lines = f.read().split("\n")
-        in_notes = False
+        mode = "tags"
         notes_lines = []
         for line in lines:
-            if in_notes:
+            if mode == "notes":
                 notes_lines.append(line)
                 continue
-            if line.strip().startswith("Notes:"):
-                in_notes = True
+            stripped = line.strip()
+            if stripped.startswith("Workouts:"):
+                mode = "workouts"
+                continue
+            if stripped.startswith("Notes:"):
+                mode = "notes"
                 rest = line.split(":", 1)[1].strip()
                 if rest:
                     notes_lines.append(rest)
                 continue
-            if ":" in line:
+            if mode == "workouts":
+                parts = line.split("|")
+                if len(parts) == 3:
+                    start_str, end_str, label = parts
+                    workouts[start_str.strip()] = {"end": end_str.strip(), "label": label.strip()}
+                continue
+            if mode == "tags" and ":" in line:
                 tag, val = line.split(":", 1)
                 tags[tag.strip()] = val.strip().lower() in ("yes", "true", "y", "1")
         notes = "\n".join(notes_lines).strip()
-    return tags, notes
+    return tags, notes, workouts
 
 
-def save_journal_entry(d, tag_values, notes):
+def save_journal_entry(d, tag_values, notes, workout_labels=None):
     os.makedirs(JOURNAL_DIR, exist_ok=True)
     lines = [f"{tag}: {'Yes' if val else 'No'}" for tag, val in tag_values.items()]
+    if workout_labels:
+        lines.append("Workouts:")
+        for start_str, info in workout_labels.items():
+            lines.append(f"{start_str}|{info['end']}|{info['label']}")
     lines.append("Notes:")
     if notes:
         lines.append(notes)
@@ -693,11 +707,75 @@ def has_journal_entry(d):
     return os.path.exists(_journal_path(d))
 
 
+COMMON_SPORTS = ["Workout", "Run", "Walk", "Cycling", "Weights/Strength", "HIIT", "Yoga/Stretching",
+                  "Swimming", "Sports/Game", "Hiking", "Other"]
+WORKOUT_HRR_THRESHOLD = 0.40   # heart-rate-reserve fraction that counts as "working out", not just active
+WORKOUT_MIN_MINUTES = 20       # shorter sustained elevations are treated as daily activity, not a session
+WORKOUT_MIN_STRAIN = 5.0       # filters out trivial blips that technically qualify but barely register
+WORKOUT_MERGE_GAP_MINUTES = 5  # brief dips (a red light, a rest between sets) don't split one session
+
+
+def detect_workout_sessions(day_df, resting_hr, max_hr_override):
+    """Find sustained elevated-HR sessions during waking hours - same block-detection idea as
+    sleep, but looking for sustained HIGH heart-rate-reserve instead of low. Doesn't try to name
+    the sport (steps-per-minute is too weak a signal to reliably tell cycling from rowing from
+    an elliptical) - just a rough starting suggestion the person can correct."""
+    if day_df.empty or 'HEART_RATE' not in day_df.columns or 'Datetime' not in day_df.columns:
+        return []
+    d = day_df.dropna(subset=['HEART_RATE']).sort_values('Datetime').reset_index(drop=True)
+    if d.empty or pd.isna(resting_hr):
+        return []
+    hr_reserve = max(1.0, max_hr_override - resting_hr)
+    smoothed = d['HEART_RATE'].rolling(3, min_periods=1, center=True).median()
+    hrr_frac_all = ((smoothed - resting_hr) / hr_reserve).clip(lower=0, upper=1)
+    is_elevated = hrr_frac_all >= WORKOUT_HRR_THRESHOLD
+
+    block_id = (is_elevated != is_elevated.shift()).cumsum()
+    raw_blocks = []
+    for _, g in d.groupby(block_id):
+        if not is_elevated.loc[g.index[0]]:
+            continue
+        gaps = g['Datetime'].diff().dt.total_seconds().dropna() / 60.0
+        sample_width = gaps.median() if not gaps.empty else 1.0
+        span_min = (g['Datetime'].max() - g['Datetime'].min()).total_seconds() / 60.0 + (sample_width if pd.notna(sample_width) else 1.0)
+        raw_blocks.append({"start": g['Datetime'].min(), "end": g['Datetime'].max(), "span_min": span_min})
+
+    merged = []
+    for b in sorted(raw_blocks, key=lambda x: x["start"]):
+        if merged and (b["start"] - merged[-1]["end"]).total_seconds() / 60.0 <= WORKOUT_MERGE_GAP_MINUTES:
+            merged[-1]["end"] = max(merged[-1]["end"], b["end"])
+        else:
+            merged.append({"start": b["start"], "end": b["end"]})
+
+    sessions = []
+    for m in merged:
+        span_min = (m["end"] - m["start"]).total_seconds() / 60.0
+        if span_min < WORKOUT_MIN_MINUTES:
+            continue
+        seg = d[(d['Datetime'] >= m["start"]) & (d['Datetime'] <= m["end"])]
+        seg_hr = seg['HEART_RATE'].dropna()
+        if seg_hr.empty:
+            continue
+        frac = ((seg_hr - resting_hr) / hr_reserve).clip(lower=0, upper=1)
+        trimp = (frac * 0.64 * np.exp(1.92 * frac)).sum()
+        session_strain = min(21.0, round(21.0 * (1.0 - np.exp(-trimp / 240.0)), 1))
+        if session_strain < WORKOUT_MIN_STRAIN:
+            continue
+        total_steps = seg['STEPS'].sum() if 'STEPS' in seg.columns else 0
+        steps_per_min = total_steps / max(1.0, span_min)
+        suggested = "Run" if steps_per_min >= 80 else ("Walk" if steps_per_min >= 25 else "Workout")
+        sessions.append({"start": m["start"], "end": m["end"], "duration_min": span_min,
+                          "avg_hr": seg_hr.mean(), "peak_hr": seg_hr.max(), "total_steps": int(total_steps),
+                          "session_strain": session_strain, "suggested_label": suggested})
+    return sessions
+
 
 if not df_activity.empty and 'Date' in df_activity.columns:
     available_dates = sorted(df_activity['Date'].dropna().unique(), reverse=True)
 else:
     available_dates = []
+
+SIDEBAR_PAGE_DAYS = 14
 
 if "week_offset" not in st.session_state:
     st.session_state.week_offset = 0
@@ -706,8 +784,8 @@ if available_dates:
     most_recent = available_dates[0]
     earliest = available_dates[-1]
 
-    week_end = most_recent - timedelta(days=7 * st.session_state.week_offset)
-    week_dates = [week_end - timedelta(days=i) for i in range(7)]
+    week_end = most_recent - timedelta(days=SIDEBAR_PAGE_DAYS * st.session_state.week_offset)
+    week_dates = [week_end - timedelta(days=i) for i in range(SIDEBAR_PAGE_DAYS)]
 
     can_go_back = week_dates[-1] > earliest
     can_go_forward = st.session_state.week_offset > 0
@@ -726,7 +804,7 @@ if available_dates:
             st.rerun()
 
     day_info_by_date = {}
-    with st.spinner("Loading week..."):
+    with st.spinner("Loading history..."):
         for d in week_dates:
             strain_info_d = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                                       st.session_state.max_hr_override, st.session_state.resting_hr_override,
@@ -880,41 +958,89 @@ with col8:
 
 st.divider()
 
-st.subheader("👟 7-Day Step Trend")
-if not last_7_days.empty and "STEPS" in last_7_days.columns and last_7_days['STEPS'].sum() > 0:
-    daily_steps = last_7_days.groupby(last_7_days['Date'])['STEPS'].sum().reset_index()
-    daily_steps['Day'] = daily_steps['Date'].apply(lambda d: d.strftime('%a %d'))
-    step_chart = alt.Chart(daily_steps).mark_bar(color="#29b5e8").encode(
-        x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y('STEPS:Q', title='Steps'),
-        tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip('STEPS:Q', title='Steps')],
-    ).properties(height=280)
-    st.altair_chart(step_chart, width='stretch')
-else:
-    st.info("No step data available.")
+st.subheader("📈 Trends")
+trend_period = st.radio("Period", ["7 Days", "30 Days", "1 Year", "All Time"], horizontal=True, index=0,
+                         key="trend_period", label_visibility="collapsed")
 
-st.subheader("💤 7-Day Sleep Trend")
-sleep_week_dates = sorted(selected_date - timedelta(days=i) for i in range(7))
-sleep_week_rows = []
-for d in sleep_week_dates:
-    si = compute_sleep_and_hrv(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name)
-    sleep_week_rows.append({"Day": d.strftime('%a %d'), "MINUTES": si["sleep_duration_mins"]})
-sleep_week_df = pd.DataFrame(sleep_week_rows)
-if sleep_week_df['MINUTES'].sum() > 0:
-    sleep_chart = alt.Chart(sleep_week_df).mark_bar(color="#9b59b6").encode(
-        x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
-        y=alt.Y('MINUTES:Q', title='Minutes'),
-        tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip('MINUTES:Q', title='Minutes')],
-    ).properties(height=280)
-    st.altair_chart(sleep_chart, width='stretch')
+if trend_period == "7 Days":
+    range_start = selected_date - timedelta(days=6)
+elif trend_period == "30 Days":
+    range_start = selected_date - timedelta(days=29)
+elif trend_period == "1 Year":
+    range_start = selected_date - timedelta(days=364)
 else:
-    st.info("No sleep data available.")
+    range_start = available_dates[-1] if available_dates else selected_date
+if available_dates:
+    range_start = max(range_start, available_dates[-1])
+
+range_dates = [range_start + timedelta(days=i) for i in range((selected_date - range_start).days + 1)]
+
+trend_rows = []
+with st.spinner(f"Loading {trend_period.lower()}..."):
+    for d in range_dates:
+        s_info = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                          max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
+        stress_prev_d = fetch_global_metric(["STRESS"], d - timedelta(days=1))
+        r_info = compute_recovery_score(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                         max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
+                                         tuple(available_dates), stress_prev_d)
+        trend_rows.append({"Date": pd.Timestamp(d), "Steps": s_info["total_steps"], "Sleep_min": s_info["sleep_duration_mins"],
+                            "Strain": s_info["strain_score"], "Recovery": r_info["score"], "HRV": s_info["hrv_val"]})
+trend_df = pd.DataFrame(trend_rows)
+
+
+def render_trend_chart(df, col, color, y_title, height=240):
+    sub = df[["Date", col]].dropna(subset=[col])
+    if sub.empty or (sub[col] == 0).all():
+        st.info(f"No {y_title.lower()} data available for this period.")
+        return
+    use_bar = len(sub) <= 31
+    if use_bar:
+        # Ordinal day labels avoid Altair's temporal axis auto-inserting sub-day ticks
+        # (e.g. "12 PM") when there's only one data point per day.
+        sub = sub.copy()
+        sub['Day'] = sub['Date'].dt.strftime('%a %d')
+        chart = alt.Chart(sub).mark_bar(color=color).encode(
+            x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y(f'{col}:Q', title=y_title),
+            tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip(f'{col}:Q', title=y_title)],
+        ).properties(height=height)
+    else:
+        chart = alt.Chart(sub).mark_line(color=color, point=len(sub) <= 60).encode(
+            x=alt.X('Date:T', title=None, axis=alt.Axis(format='%b %d', tickCount=8)),
+            y=alt.Y(f'{col}:Q', title=y_title),
+            tooltip=[alt.Tooltip('Date:T', format='%b %d, %Y'), alt.Tooltip(f'{col}:Q', title=y_title)],
+        ).properties(height=height)
+    st.altair_chart(chart, width='stretch')
+
+
+@st.dialog("📈 Trend Detail", width="large")
+def show_trend_dialog(title, col_key, color, y_title):
+    st.subheader(title)
+    render_trend_chart(trend_df, col_key, color, y_title, height=450)
+
+
+TREND_METRICS = [
+    ("👟 Steps", "Steps", "#29b5e8", "Steps"),
+    ("💤 Sleep", "Sleep_min", "#9b59b6", "Minutes"),
+    ("🔥 Strain", "Strain", "#e67e22", "Strain"),
+    ("🔋 Recovery", "Recovery", "#2ecc71", "Recovery"),
+    ("⚡ HRV", "HRV", "#3498db", "ms"),
+]
+
+grid_cols = st.columns(2)
+for i, (title, col_key, color, y_title) in enumerate(TREND_METRICS):
+    with grid_cols[i % 2]:
+        st.markdown(f"**{title}**")
+        render_trend_chart(trend_df, col_key, color, y_title, height=180)
+        if st.button("🔍 Inspect closer", key=f"inspect_{col_key}", width='stretch'):
+            show_trend_dialog(title, col_key, color, y_title)
 
 st.divider()
 
 st.subheader("📔 Daily Journal")
 journal_tags = load_journal_tags()
-existing_tags, existing_notes = load_journal_entry(selected_date)
+existing_tags, existing_notes, existing_workouts = load_journal_entry(selected_date)
 
 tag_values = {}
 n_cols = 4
@@ -970,7 +1096,7 @@ with st.expander("📈 Journal Insights: how your trends compare"):
     else:
         rows = []
         for d in journaled_dates:
-            tags, _ = load_journal_entry(d)
+            tags, _, _ = load_journal_entry(d)
             s_info = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                               max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
             # Strain is wake-anchored and accumulates through day d, so it reflects day d itself.
@@ -1090,6 +1216,47 @@ if not hr_data.empty:
     st.line_chart(target_df.set_index('Datetime')['HEART_RATE'], color="#ff4b4b")
 else:
     st.info("No intraday heart rate data available for this specific date.")
+
+st.subheader("🏋️ Workouts Today")
+resting_hr_for_workouts = sleep_info["sleep_hr_median"] if pd.notna(sleep_info["sleep_hr_median"]) else (hr_data.quantile(0.10) if not hr_data.empty else np.nan)
+workout_sessions = detect_workout_sessions(target_df, resting_hr_for_workouts, max_hr_override)
+
+if workout_sessions:
+    st.caption("Sustained heart rate well above resting - detected automatically, but the sport itself has to be picked or typed, since HR/steps alone can't reliably tell cycling from rowing from an elliptical.")
+    new_workout_labels = {}
+    for sess in workout_sessions:
+        start_key = sess['start'].strftime('%H:%M')
+        end_str = sess['end'].strftime('%H:%M')
+        existing = existing_workouts.get(start_key, {})
+        default_label = existing.get('label', sess['suggested_label'])
+
+        with st.container(border=True):
+            st.markdown(f"**{start_key}–{end_str}** ({int(sess['duration_min'])} min)")
+            wc1, wc2, wc3 = st.columns(3)
+            wc1.metric("Avg HR", f"{sess['avg_hr']:.0f} bpm")
+            wc2.metric("Peak HR", f"{sess['peak_hr']:.0f} bpm")
+            wc3.metric("Session Strain", f"{sess['session_strain']:.1f}")
+
+            options = COMMON_SPORTS.copy()
+            preset_default = default_label if default_label in options else "Other"
+            sc1, sc2 = st.columns([1, 1])
+            with sc1:
+                sport_choice = st.selectbox("Sport", options, index=options.index(preset_default),
+                                             key=f"workout_sport_{selected_date.isoformat()}_{start_key}")
+            final_label = sport_choice
+            if sport_choice == "Other":
+                with sc2:
+                    custom = st.text_input("Specify", value=default_label if default_label not in COMMON_SPORTS else "",
+                                            key=f"workout_sport_custom_{selected_date.isoformat()}_{start_key}")
+                    final_label = custom.strip() if custom.strip() else "Other"
+            new_workout_labels[start_key] = {"end": end_str, "label": final_label}
+
+    if st.button("💾 Save Workout Labels", key=f"save_workouts_{selected_date.isoformat()}"):
+        cur_tags, cur_notes, _ = load_journal_entry(selected_date)
+        save_journal_entry(selected_date, cur_tags, cur_notes, new_workout_labels)
+        st.rerun()
+else:
+    st.caption("No workout-level sessions detected today (sustained heart rate meaningfully above resting).")
 
 with st.expander("⚙️ Database Transparency & Sleep Table Inspector"):
     st.write(f"Active Activity Table: `{activity_table}` | Active Sleep Table: `{active_sleep_table if active_sleep_table else 'None'}`")
