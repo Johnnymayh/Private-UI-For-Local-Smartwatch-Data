@@ -456,7 +456,8 @@ def compute_strain_for_date(target_date, activity_table, active_sleep_table, mti
 
 
 # Global Metric Hunter for SpO2 & Stress
-def fetch_global_metric(keywords, target_date):
+@st.cache_data
+def fetch_global_metric(keywords, target_date, mtime):
     for t, cols in schema.items():
         val_col = next((c for c in cols if any(k in c for k in keywords)), None)
         if not val_col and any(k in t.upper() for k in keywords):
@@ -809,7 +810,7 @@ if available_dates:
             strain_info_d = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                                       st.session_state.max_hr_override, st.session_state.resting_hr_override,
                                                       st.session_state.strain_sensitivity)
-            stress_prev_d = fetch_global_metric(["STRESS"], d - timedelta(days=1))
+            stress_prev_d = fetch_global_metric(("STRESS",), d - timedelta(days=1), _db_mtime())
             recovery_d = compute_recovery_score(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                                  st.session_state.max_hr_override, st.session_state.resting_hr_override,
                                                  st.session_state.strain_sensitivity, tuple(available_dates), stress_prev_d)
@@ -891,9 +892,9 @@ strain_info = compute_strain_for_date(selected_date, activity_table, active_slee
                                        max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
 strain_score = strain_info["strain_score"]
 
-spo2_val = fetch_global_metric(["SPO2", "OXYGEN"], selected_date)
-stress_val = fetch_global_metric(["STRESS"], selected_date)
-prev_stress_val = fetch_global_metric(["STRESS"], selected_date - timedelta(days=1))
+spo2_val = fetch_global_metric(("SPO2", "OXYGEN"), selected_date, _db_mtime())
+stress_val = fetch_global_metric(("STRESS",), selected_date, _db_mtime())
+prev_stress_val = fetch_global_metric(("STRESS",), selected_date - timedelta(days=1), _db_mtime())
 
 def classify_stress(val):
     """Xiaomi/Huami's stress score follows the same 0-100 HRV-derived scale used across the
@@ -969,9 +970,11 @@ elif trend_period == "30 Days":
 elif trend_period == "1 Year":
     range_start = selected_date - timedelta(days=364)
 else:
+    # "All Time" is the one period that's genuinely supposed to be bounded by the earliest
+    # date any data exists - there's nothing real to show before that. 7/30/365-day windows
+    # deliberately do NOT get clamped to available data (see below): they should always show
+    # the actual calendar window, even if most of it has no data synced yet.
     range_start = available_dates[-1] if available_dates else selected_date
-if available_dates:
-    range_start = max(range_start, available_dates[-1])
 
 range_dates = [range_start + timedelta(days=i) for i in range((selected_date - range_start).days + 1)]
 
@@ -980,33 +983,50 @@ with st.spinner(f"Loading {trend_period.lower()}..."):
     for d in range_dates:
         s_info = compute_strain_for_date(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                           max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)
-        stress_prev_d = fetch_global_metric(["STRESS"], d - timedelta(days=1))
+        stress_prev_d = fetch_global_metric(("STRESS",), d - timedelta(days=1), _db_mtime())
+        stress_d = fetch_global_metric(("STRESS",), d, _db_mtime())
         r_info = compute_recovery_score(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
                                          max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
                                          tuple(available_dates), stress_prev_d)
         trend_rows.append({"Date": pd.Timestamp(d), "Steps": s_info["total_steps"], "Sleep_min": s_info["sleep_duration_mins"],
-                            "Strain": s_info["strain_score"], "Recovery": r_info["score"], "HRV": s_info["hrv_val"]})
+                            "Strain": s_info["strain_score"], "Recovery": r_info["score"], "HRV": s_info["hrv_val"],
+                            "Stress": stress_d})
 trend_df = pd.DataFrame(trend_rows)
 
 
 def render_trend_chart(df, col, color, y_title, height=240):
-    sub = df[["Date", col]].dropna(subset=[col])
-    if sub.empty or (sub[col] == 0).all():
+    # Deliberately NOT dropping missing days here (unlike the old dropna approach) - the whole
+    # point of the period selector is to show the true calendar window, gaps and all, so a 30-day
+    # view of a device that's only had a week of data reads as "a week of bars at the right edge
+    # of a 30-day chart", not as a squashed-together 7-bar chart mislabeled as 30 days.
+    sub = df[["Date", col]].copy()
+    if sub[col].fillna(0).eq(0).all():
         st.info(f"No {y_title.lower()} data available for this period.")
         return
-    use_bar = len(sub) <= 31
+
+    n = len(sub)
+    use_bar = n <= 31
     if use_bar:
-        # Ordinal day labels avoid Altair's temporal axis auto-inserting sub-day ticks
-        # (e.g. "12 PM") when there's only one data point per day.
-        sub = sub.copy()
-        sub['Day'] = sub['Date'].dt.strftime('%a %d')
+        # Ordinal day labels give fat, evenly-spaced bars (a continuous time scale draws bars
+        # only ~2px wide). Forcing the scale's domain to every day in the range - not just the
+        # days that have data - keeps missing days as visible gaps in their correct calendar
+        # position. Tick labels are then thinned to ~7 evenly-spaced ones so a 30-day chart
+        # doesn't cram 30 overlapping labels along the axis.
+        day_fmt = '%a %d' if n <= 7 else '%b %d'
+        sub['Day'] = sub['Date'].dt.strftime(day_fmt)
+        day_order = sub['Day'].tolist()
+        tick_idx = sorted(set(np.linspace(0, n - 1, num=min(7, n)).round().astype(int)))
+        tick_values = [day_order[i] for i in tick_idx]
         chart = alt.Chart(sub).mark_bar(color=color).encode(
-            x=alt.X('Day:O', sort=None, title=None, axis=alt.Axis(labelAngle=0)),
+            x=alt.X('Day:O', sort=None, title=None, scale=alt.Scale(domain=day_order),
+                     axis=alt.Axis(labelAngle=0, values=tick_values)),
             y=alt.Y(f'{col}:Q', title=y_title),
-            tooltip=[alt.Tooltip('Day:N', title='Day'), alt.Tooltip(f'{col}:Q', title=y_title)],
+            tooltip=[alt.Tooltip('Date:T', title='Date', format='%b %d, %Y'), alt.Tooltip(f'{col}:Q', title=y_title)],
         ).properties(height=height)
     else:
-        chart = alt.Chart(sub).mark_line(color=color, point=len(sub) <= 60).encode(
+        # 1 Year / long All Time ranges: a thin line naturally handles 365 data points, most of
+        # which may be empty - Altair just leaves a gap wherever the value is missing.
+        chart = alt.Chart(sub).mark_line(color=color, point=n <= 60).encode(
             x=alt.X('Date:T', title=None, axis=alt.Axis(format='%b %d', tickCount=8)),
             y=alt.Y(f'{col}:Q', title=y_title),
             tooltip=[alt.Tooltip('Date:T', format='%b %d, %Y'), alt.Tooltip(f'{col}:Q', title=y_title)],
@@ -1026,6 +1046,7 @@ TREND_METRICS = [
     ("🔥 Strain", "Strain", "#e67e22", "Strain"),
     ("🔋 Recovery", "Recovery", "#2ecc71", "Recovery"),
     ("⚡ HRV", "HRV", "#3498db", "ms"),
+    ("🧠 Stress", "Stress", "#e74c3c", "Stress"),
 ]
 
 grid_cols = st.columns(2)
@@ -1107,7 +1128,7 @@ with st.expander("📈 Journal Insights: how your trends compare"):
             next_day_info = compute_strain_for_date(d + timedelta(days=1), activity_table, active_sleep_table, _db_mtime(),
                                                       st.session_state.tz_name, max_hr_override, resting_hr_override,
                                                       st.session_state.strain_sensitivity)
-            stress_on_d = fetch_global_metric(["STRESS"], d)
+            stress_on_d = fetch_global_metric(("STRESS",), d, _db_mtime())
             next_day_recovery = compute_recovery_score(d + timedelta(days=1), activity_table, active_sleep_table, _db_mtime(),
                                                          st.session_state.tz_name, max_hr_override, resting_hr_override,
                                                          st.session_state.strain_sensitivity, tuple(available_dates), stress_on_d)
