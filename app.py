@@ -519,10 +519,16 @@ def _strain_subscore(strain_val):
 
 @st.cache_data
 def compute_recovery_score(target_date, activity_table, active_sleep_table, mtime, tz_name,
-                            max_hr_override, resting_hr_override, sensitivity, available_dates_tuple, prev_stress):
+                            max_hr_override, resting_hr_override, sensitivity, available_dates_tuple, prev_stress,
+                            _sleep_hrv_lookup=None):
     """Recovery (0-100): sleep duration (40%) + RHR/HRV (20% each) + previous day's stress/strain
     (10% each). A missing component drops out and the remaining weights renormalize."""
-    sleep_info = compute_sleep_and_hrv(target_date, activity_table, active_sleep_table, mtime, tz_name)
+    def get_sleep_hrv(d):
+        if _sleep_hrv_lookup is not None and d in _sleep_hrv_lookup:
+            return _sleep_hrv_lookup[d]
+        return compute_sleep_and_hrv(d, activity_table, active_sleep_table, mtime, tz_name)
+
+    sleep_info = get_sleep_hrv(target_date)
     today_rhr = sleep_info["sleep_hr_median"]
     today_hrv = sleep_info["hrv_val"]
     sleep_hours = sleep_info["sleep_duration_mins"] / 60.0 if sleep_info["sleep_duration_mins"] > 0 else None
@@ -537,7 +543,7 @@ def compute_recovery_score(target_date, activity_table, active_sleep_table, mtim
     prior_dates = sorted([d for d in available_dates_tuple if d < target_date])[-30:]
     prior_rhrs, prior_hrvs = [], []
     for d in prior_dates:
-        pi = compute_sleep_and_hrv(d, activity_table, active_sleep_table, mtime, tz_name)
+        pi = get_sleep_hrv(d)
         if pd.notna(pi["sleep_hr_median"]):
             prior_rhrs.append(pi["sleep_hr_median"])
         if pd.notna(pi["hrv_val"]):
@@ -933,34 +939,43 @@ def trend_range_dates(period, end_date):
 
 
 @st.cache_data
-def compute_day_trend_metrics(d, activity_table, active_sleep_table, mtime, tz_name,
-                               max_hr_override, resting_hr_override, sensitivity, available_dates_tuple):
-    has_data = d in available_dates_tuple
+def _activity_metric(d, metric_key, has_data, activity_table, active_sleep_table, mtime, tz_name,
+                      max_hr_override, resting_hr_override, sensitivity):
+    # Steps/Sleep/Strain/HRV all come from one call - no need to also touch Recovery/Stress.
     s_info = compute_strain_for_date(d, activity_table, active_sleep_table, mtime, tz_name,
                                       max_hr_override, resting_hr_override, sensitivity)
-    stress_prev_d = fetch_global_metric(("STRESS",), d - timedelta(days=1), mtime)
-    stress_d = fetch_global_metric(("STRESS",), d, mtime)
-    r_info = compute_recovery_score(d, activity_table, active_sleep_table, mtime, tz_name,
-                                     max_hr_override, resting_hr_override, sensitivity,
-                                     available_dates_tuple, stress_prev_d)
-    # Steps/Sleep/Strain default to 0 (not NaN) with no synced data - only trust them if has_data.
-    return {
-        "Steps": s_info["total_steps"] if has_data else np.nan,
-        "Sleep_min": s_info["sleep_duration_mins"] if has_data else np.nan,
-        "Strain": s_info["strain_score"] if has_data else np.nan,
-        "Recovery": r_info["score"],
-        "HRV": s_info["hrv_val"],
-        "Stress": stress_d,
-    }
+    if metric_key == "HRV":
+        return s_info["hrv_val"]
+    if not has_data:
+        return np.nan
+    return {"Steps": s_info["total_steps"], "Sleep_min": s_info["sleep_duration_mins"],
+            "Strain": s_info["strain_score"]}[metric_key]
 
 
-def load_trend_df(period):
+def load_trend_df(period, metric_key):
     dates = trend_range_dates(period, selected_date)
     with st.spinner(f"Loading {period.lower()}..."):
-        rows = [{"Date": pd.Timestamp(d), **compute_day_trend_metrics(
-            d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
-            max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
-            available_dates_tuple)} for d in dates]
+        if metric_key == "Recovery":
+            # Precompute sleep/HRV once for the window this needs, instead of letting
+            # compute_recovery_score redo up to 30 prior-date lookups per target date.
+            lookback_start = min(dates) - timedelta(days=30)
+            needed = [d for d in available_dates_tuple if lookback_start <= d <= max(dates)]
+            sleep_hrv_lookup = {d: compute_sleep_and_hrv(d, activity_table, active_sleep_table, _db_mtime(),
+                                                          st.session_state.tz_name) for d in needed}
+            rows = []
+            for d in dates:
+                stress_prev_d = fetch_global_metric(("STRESS",), d - timedelta(days=1), _db_mtime())
+                r_info = compute_recovery_score(d, activity_table, active_sleep_table, _db_mtime(), st.session_state.tz_name,
+                                                 max_hr_override, resting_hr_override, st.session_state.strain_sensitivity,
+                                                 available_dates_tuple, stress_prev_d, _sleep_hrv_lookup=sleep_hrv_lookup)
+                rows.append({"Date": pd.Timestamp(d), "Recovery": r_info["score"]})
+        elif metric_key == "Stress":
+            rows = [{"Date": pd.Timestamp(d), "Stress": fetch_global_metric(("STRESS",), d, _db_mtime())} for d in dates]
+        else:
+            rows = [{"Date": pd.Timestamp(d), metric_key: _activity_metric(
+                d, metric_key, d in available_dates_tuple, activity_table, active_sleep_table, _db_mtime(),
+                st.session_state.tz_name, max_hr_override, resting_hr_override, st.session_state.strain_sensitivity)}
+                for d in dates]
     return pd.DataFrame(rows)
 
 
@@ -998,7 +1013,7 @@ def render_trend_chart(df, col, color, y_title, height=240):
 @st.dialog("📈 Trend Detail", width="large")
 def show_trend_dialog(title, col_key, color, y_title, period):
     st.subheader(title)
-    render_trend_chart(load_trend_df(period), col_key, color, y_title, height=450)
+    render_trend_chart(load_trend_df(period, col_key), col_key, color, y_title, height=450)
 
 
 TREND_METRICS = [
@@ -1017,7 +1032,7 @@ for i, (title, col_key, color, y_title) in enumerate(TREND_METRICS):
         title_col.markdown(f"**{title}**")
         period = period_col.selectbox("Period", TREND_PERIODS, index=0, key=f"period_{col_key}",
                                        label_visibility="collapsed")
-        render_trend_chart(load_trend_df(period), col_key, color, y_title, height=180)
+        render_trend_chart(load_trend_df(period, col_key), col_key, color, y_title, height=180)
         if st.button("🔍 Inspect closer", key=f"inspect_{col_key}", width='stretch'):
             show_trend_dialog(title, col_key, color, y_title, period)
 
